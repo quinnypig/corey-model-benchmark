@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}Quinnferno{% endblock %}</title>
+  <style>
+    :root{--ink:#171310;--paper:#f5efe2;--card:#fffaf0;--red:#c73f2a;--orange:#ed7d31;--gold:#e9bc57;--green:#277c67;--muted:#736b62;--line:#d7c9b2;--shadow:0 12px 35px #3f2a1918}
+    *{box-sizing:border-box} body{margin:0;background:linear-gradient(180deg,#18110d 0 250px,var(--paper) 250px);color:var(--ink);font:16px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    a{color:var(--red)} .shell{width:min(1180px,calc(100% - 32px));margin:auto}.top{height:84px;display:flex;align-items:center;justify-content:space-between;color:white}.brand{font:800 28px/1 Georgia,serif;color:white;text-decoration:none;letter-spacing:-.5px}.brand span{color:var(--orange)}nav a{color:#eadfce;text-decoration:none;margin-left:22px;font-weight:650}
+    .hero{color:white;padding:35px 0 54px}.hero h1{font:800 clamp(46px,8vw,88px)/.92 Georgia,serif;letter-spacing:-3px;margin:0;max-width:900px}.hero p{color:#dbcdbf;font-size:19px;max-width:700px;margin:20px 0 0}
+    main{padding:32px 0 80px}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);padding:24px;margin-bottom:22px}.grid{display:grid;gap:20px}.grid.two{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}.grid.three{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+    h1,h2,h3{font-family:Georgia,serif;letter-spacing:-.02em}h2{margin:0 0 16px;font-size:28px}h3{margin:0 0 10px}.eyebrow{text-transform:uppercase;letter-spacing:.13em;color:var(--red);font-size:12px;font-weight:850}.muted{color:var(--muted)}
+    button,.button{border:0;border-radius:999px;background:var(--red);color:white;padding:11px 18px;font-weight:800;cursor:pointer;text-decoration:none;display:inline-block}button.secondary,.button.secondary{background:#322a25}.button.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+    input,select,textarea{font:inherit;border:1px solid var(--line);background:white;border-radius:9px;padding:9px 11px;width:100%}input[type=checkbox],input[type=radio]{width:auto}.field{margin-bottom:16px}.field label{display:block;font-weight:750;margin-bottom:6px}.checks{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px}.check{display:flex;gap:9px;align-items:flex-start;background:#fff;border:1px solid #e5dac8;border-radius:10px;padding:10px}.check small{display:block;color:var(--muted)}
+    table{width:100%;border-collapse:collapse;font-size:14px}th{text-align:left;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}th,td{padding:11px 9px;border-bottom:1px solid #e7ddcc;vertical-align:top}code{background:#eee3d1;border-radius:5px;padding:2px 5px}.status{display:inline-flex;align-items:center;gap:6px;border-radius:99px;padding:4px 9px;background:#e8dfd2;font-size:12px;font-weight:800}.status.completed{background:#d9eee7;color:#145c49}.status.running,.status.queued{background:#fff0c7;color:#795400}.status.error,.status.completed_with_errors{background:#f7d9d1;color:#8f291b}
+    .progress{height:13px;background:#e6dac8;border-radius:20px;overflow:hidden}.progress>i{display:block;height:100%;background:linear-gradient(90deg,var(--red),var(--orange),var(--gold));transition:width .4s}.metric{padding:18px;border:1px solid var(--line);border-radius:12px;background:#fff}.metric b{display:block;font:800 30px/1 Georgia,serif;margin-top:8px}.bar{height:18px;background:#eadfce;border-radius:10px;overflow:hidden}.bar i{display:block;height:100%;background:var(--red)}
+    pre{white-space:pre-wrap;word-break:break-word;background:#211b17;color:#f8eee2;padding:18px;border-radius:10px;max-height:540px;overflow:auto;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}.flash{padding:12px 16px;background:#f7d9d1;color:#812517;border-radius:10px;margin-bottom:18px}.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:18px}.plat{background:white;border:1px solid var(--line);border-radius:14px;overflow:hidden}.plat img{display:block;width:100%;aspect-ratio:1.15;object-fit:contain;background:#f0e8da}.plat .caption{padding:14px}.pill{font-size:11px;font-weight:850;padding:3px 7px;border-radius:99px;background:#eee1ce}.pill.good{background:#d9eee7;color:#145c49}.pill.bad{background:#f7d9d1;color:#8f291b}
+    .models{max-height:390px;overflow:auto;border:1px solid var(--line);background:#fff;border-radius:10px;padding:8px}.model-option{display:flex;gap:8px;padding:7px;border-bottom:1px solid #eee5d7}.model-option:last-child{border:0}.model-option span{overflow:hidden}.model-option small{display:block;color:var(--muted)}
+    @media(max-width:650px){.top nav{display:none}.hero h1{letter-spacing:-2px}.card{padding:17px}.shell{width:min(100% - 20px,1180px)}table{display:block;overflow-x:auto}}
+  </style>
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <header><div class="shell top"><a class="brand" href="/">Quinn<span>ferno</span></a><nav><a href="/">Runs</a><a href="/platypuses">Platypuses</a></nav></div></header>
+  {% block hero %}{% endblock %}
+  <main class="shell">
+    {% with messages = get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="flash">{{ message }}</div>{% endfor %}{% endwith %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

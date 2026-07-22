@@ -273,6 +273,21 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_protocol_validate(_args: argparse.Namespace) -> int:
+    from .protocol import load_protocol
+
+    suite = load_protocol()
+    print(f"Valid: {suite.path} ({len(suite.evals)} evals, {suite.weighted_total:g} weighted points)")
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    from .webapp import serve
+
+    serve(host=args.host, port=args.port, debug=args.debug)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="corey-bench", description="Run Corey Quinn's personal model benchmark")
     parser.add_argument("--suite", help="path to benchmark suite JSON")
@@ -311,6 +326,15 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser = subparsers.add_parser("report", help="regenerate a run report")
     report_parser.add_argument("run_dir")
     report_parser.set_defaults(func=cmd_report)
+
+    protocol_parser = subparsers.add_parser("protocol-validate", help="validate the Quinnferno v1 protocol")
+    protocol_parser.set_defaults(func=cmd_protocol_validate)
+
+    serve_parser = subparsers.add_parser("serve", help="run the Quinnferno web application and job queue")
+    serve_parser.add_argument("--host", default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=8765)
+    serve_parser.add_argument("--debug", action="store_true")
+    serve_parser.set_defaults(func=cmd_serve)
     return parser
 
 

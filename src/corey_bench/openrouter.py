@@ -19,6 +19,8 @@ class Completion:
     reasoning: str | None
     finish_reason: str | None
     native_finish_reason: str | None
+    annotations: list[dict[str, Any]]
+    request_attempts: int = 1
 
 
 class OpenRouterError(RuntimeError):
@@ -54,15 +56,14 @@ class OpenRouterClient:
         self.timeout = timeout
         self.attempts = attempts
 
-    def require_models_available(self, models: list[str]) -> None:
-        """Verify exact model IDs against the API key's routing policy."""
+    def list_models(self) -> list[dict[str, Any]]:
         request = urllib.request.Request(
             f"{self.base_url}/models/user",
             method="GET",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
-                "HTTP-Referer": "https://github.com/QuinnyPig/corey-model-benchmark",
-                "X-Title": "Corey Quinn model benchmark",
+                "HTTP-Referer": "https://github.com/quinnypig/corey-model-benchmark",
+                "X-Title": "Quinnferno",
             },
         )
         try:
@@ -70,17 +71,17 @@ class OpenRouterClient:
                 raw = json.loads(response.read())
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")[:2000]
-            raise OpenRouterError(
-                f"OpenRouter model preflight failed with HTTP {exc.code}: {error_body}"
-            ) from exc
+            raise OpenRouterError(f"OpenRouter model catalog failed with HTTP {exc.code}: {error_body}") from exc
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise OpenRouterError(f"OpenRouter model preflight failed: {exc}") from exc
-
+            raise OpenRouterError(f"OpenRouter model catalog failed: {exc}") from exc
         data = raw.get("data") if isinstance(raw, dict) else None
         if not isinstance(data, list):
-            raise OpenRouterError(
-                "OpenRouter model preflight returned an invalid response: expected a data array"
-            )
+            raise OpenRouterError("OpenRouter model catalog returned an invalid response: expected a data array")
+        return [item for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)]
+
+    def require_models_available(self, models: list[str]) -> None:
+        """Verify exact model IDs against the API key's routing policy."""
+        data = self.list_models()
         available: set[str] = set()
         for index, item in enumerate(data):
             model_id = item.get("id") if isinstance(item, dict) else None
@@ -100,35 +101,44 @@ class OpenRouterClient:
                 + ". Model IDs are exact; free and paid variants are not interchangeable."
             )
 
-    def complete(
+    def complete_messages(
         self,
         *,
         model: str,
-        system: str,
-        prompt: str,
+        messages: list[dict[str, Any]],
         max_tokens: int,
-        temperature: float,
+        temperature: float | None,
         seed: int | None,
         reasoning: str,
+        condition: str = "weights-only",
     ) -> Completion:
         payload: dict[str, Any] = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
+            "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": temperature,
             "usage": {"include": True},
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
         if seed is not None:
             payload["seed"] = seed
         if reasoning == "off":
             payload["reasoning"] = {"enabled": False}
         elif reasoning == "on":
             payload["reasoning"] = {"enabled": True}
-        else:
+        elif reasoning != "provider-default":
             payload["reasoning"] = {"effort": reasoning}
+        if condition == "search-enabled":
+            payload["tools"] = [
+                {
+                    "type": "openrouter:web_search",
+                    "search_context_size": "medium",
+                    "max_total_results": 10,
+                }
+            ]
+        return self._send_completion(payload)
+
+    def _send_completion(self, payload: dict[str, Any]) -> Completion:
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
@@ -137,11 +147,11 @@ class OpenRouterClient:
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/QuinnyPig/corey-model-benchmark",
-                "X-Title": "Corey Quinn model benchmark",
+                "HTTP-Referer": "https://github.com/quinnypig/corey-model-benchmark",
+                "X-Title": "Quinnferno",
             },
         )
-
+        last_retry_after = 0.0
         for attempt in range(1, self.attempts + 1):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -162,15 +172,46 @@ class OpenRouterClient:
                     reasoning=message.get("reasoning"),
                     finish_reason=choice.get("finish_reason"),
                     native_finish_reason=choice.get("native_finish_reason"),
+                    annotations=message.get("annotations") if isinstance(message.get("annotations"), list) else [],
+                    request_attempts=attempt,
                 )
             except urllib.error.HTTPError as exc:
                 error_body = exc.read().decode("utf-8", errors="replace")[:2000]
                 retryable = exc.code == 429 or exc.code >= 500
+                retry_header = exc.headers.get("Retry-After") if exc.headers else None
+                try:
+                    last_retry_after = min(120.0, max(0.0, float(retry_header))) if retry_header else 0.0
+                except ValueError:
+                    last_retry_after = 0.0
                 if not retryable or attempt == self.attempts:
                     raise OpenRouterError(f"OpenRouter HTTP {exc.code}: {error_body}") from exc
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
                 if attempt == self.attempts:
                     raise OpenRouterError(f"OpenRouter request failed: {exc}") from exc
-            delay = min(20.0, 2 ** (attempt - 1)) + random.random()
+            delay = max(last_retry_after, min(20.0, 2 ** (attempt - 1)) + random.random())
             time.sleep(delay)
         raise AssertionError("unreachable")
+
+    def complete(
+        self,
+        *,
+        model: str,
+        system: str,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        seed: int | None,
+        reasoning: str,
+    ) -> Completion:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        return self.complete_messages(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
+            reasoning=reasoning,
+        )

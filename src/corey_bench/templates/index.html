@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block hero %}<section class="shell hero"><div class="eyebrow">The Quinn Eval Suite</div><h1>Abandon benchmarks,<br>all ye who enter.</h1><p>Queue up to ten models, send them through seven tiers of AWS arcana and weaponized absurdity, then inspect every receipt.</p></section>{% endblock %}
+{% block content %}
+<form method="post" action="/runs" id="run-form">
+  <input type="hidden" name="csrf" value="{{ csrf_token }}">
+  <div class="grid two">
+    <section class="card">
+      <div class="eyebrow">Step one</div><h2>Choose models</h2>
+      {% if catalog_error %}<div class="flash">{{ catalog_error }}</div>{% endif %}
+      <input id="model-filter" placeholder="Filter {{ models|length }} OpenRouter models…" autocomplete="off">
+      <div class="models" id="models">
+      {% for model in models %}
+        <label class="model-option" data-search="{{ (model.get('name','') ~ ' ' ~ model.get('id',''))|lower }}"><input type="checkbox" name="models" value="{{ model['id'] }}"><span><strong>{{ model.get('name',model['id']) }}</strong><small>{{ model['id'] }} · {{ model.get('context_length','?') }} context</small></span></label>
+      {% endfor %}
+      </div>
+      <div class="field" style="margin-top:14px"><label for="custom_models">Exact IDs not shown above</label><textarea name="custom_models" id="custom_models" rows="2" placeholder="one OpenRouter model ID per line"></textarea></div>
+    </section>
+    <section class="card">
+      <div class="eyebrow">Treatment</div><h2>Run settings</h2>
+      <div class="grid two">
+        <div class="field"><label>Temperature</label><input name="temperature" type="number" min="0" max="2" step="0.1" value="1.0"></div>
+        <div class="field"><label>Repetitions</label><input name="repetitions" type="number" min="1" max="10" placeholder="eval default"></div>
+        <div class="field"><label>Reasoning</label><select name="reasoning"><option value="provider-default">Provider default</option><option>off</option><option>on</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option></select></div>
+        <div class="field"><label>Variant seed</label><input name="seed" type="number" value="8675309"></div>
+        <div class="field"><label>Hard run budget (USD)</label><input name="max_budget_usd" type="number" min="1" step="1" value="50"></div>
+      </div>
+      <div class="field"><label>Conditions</label><label class="check"><input type="checkbox" name="conditions" value="weights-only" checked> Weights only</label><label class="check"><input type="checkbox" name="conditions" value="search-enabled"> Search-enabled second passes where allowed</label><label class="check"><input type="checkbox" name="conditions" value="agentic"> Agentic coding pass</label></div>
+      <div class="metric"><span class="muted">Estimated API requests</span><b id="estimate">0</b><small class="muted">Transport retries may add requests. All actual cost is retained.</small></div>
+    </section>
+  </div>
+  <section class="card">
+    <div class="eyebrow">Step two</div><h2>Choose trials</h2>
+    {% for tier in range(1,8) %}<h3>Tier {{ tier }}</h3><div class="checks" style="margin-bottom:18px">
+      {% for eval in suite.evals if eval.tier == tier %}<label class="check"><input class="eval-check" type="checkbox" name="evals" value="{{ eval.id }}" data-requests="{% if eval.execution == 'independent' %}{{ eval.prompts|length }}{% elif eval.execution == 'repeated' %}{{ eval.sample_count }}{% elif eval.execution == 'multi_turn' %}{{ eval.followups|length + 1 }}{% else %}1{% endif %}" data-reps="{{ eval.repetitions }}" {% if eval.id in default_cases %}checked{% endif %}><span><strong>{{ eval.id }} {{ eval.title }}</strong><small>{{ eval.aggregation }} · {{ eval.weight|int }} points{% if eval.human_review %} · human review{% endif %}</small></span></label>{% endfor %}
+    </div>{% endfor %}
+    <button type="submit">Descend into Quinnferno</button>
+  </section>
+</form>
+
+<section class="card"><div class="eyebrow">Durable queue</div><h2>Recent runs</h2>
+  {% if recent %}<table><thead><tr><th>Run</th><th>Status</th><th>Models</th><th>Progress</th></tr></thead><tbody>{% for run in recent %}<tr><td><a href="/runs/{{ run.run_id }}"><code>{{ run.run_id }}</code></a></td><td><span class="status {{ run.status }}">{{ run.status }}</span></td><td>{{ run.models|join(', ') }}</td><td>{{ run.completed_jobs }}/{{ run.expected_jobs }}</td></tr>{% endfor %}</tbody></table>{% else %}<p class="muted">No descents yet.</p>{% endif %}
+</section>
+<script>
+const filter=document.querySelector('#model-filter'); filter.addEventListener('input',()=>{const q=filter.value.toLowerCase();document.querySelectorAll('.model-option').forEach(el=>el.hidden=!el.dataset.search.includes(q))});
+function estimate(){const models=document.querySelectorAll('input[name=models]:checked').length+document.querySelector('#custom_models').value.split(/\n/).filter(x=>x.trim()).length;const forced=parseInt(document.querySelector('input[name=repetitions]').value||'0');let calls=0;document.querySelectorAll('.eval-check:checked').forEach(el=>calls+=parseInt(el.dataset.requests)*(forced||parseInt(el.dataset.reps)));document.querySelector('#estimate').textContent=(models*calls).toLocaleString()}
+document.querySelector('#run-form').addEventListener('input',estimate);estimate();
+</script>
+{% endblock %}
