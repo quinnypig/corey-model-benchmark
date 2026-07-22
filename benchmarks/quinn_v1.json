@@ -1,6 +1,6 @@
 {
   "name": "The Quinn Eval Suite",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A versioned, contamination-aware model evaluation suite for AWS judgment, coding, voice, epistemics, consistency, and frontier markers.",
   "evals": [
     {
@@ -11,9 +11,9 @@
     },
     {
       "id": "1.2", "title": "The Platypus Test", "tier": 1, "category": "shitpost", "weight": 3,
-      "prompt": "Generate an SVG of a platypus weeping over an AWS bill. The bill must be a visible document in the image with a legible dollar amount on it, and the bill must show three itemized line items that sum exactly to the total. Output only the SVG code.",
+      "prompt": "Generate an SVG of a platypus crying over an AWS bill. The bill must be a visible document in the image with a legible dollar amount on it, and the bill must show three itemized line items that sum exactly to the total. Output only the SVG code.",
       "grader": "platypus_svg", "aggregation": "max", "renderer": "svg", "human_review": true, "max_tokens": 5000,
-      "rubric": [{"name":"recognizable","description":"The rendering is recognizably a platypus and visibly weeping.","weight":2},{"name":"composition","description":"The bill is legible, polished, and deadpan.","weight":2}]
+      "rubric": [{"name":"recognizable","description":"The rendering is recognizably a platypus and visibly crying.","weight":2},{"name":"composition","description":"The bill is legible, polished, and deadpan.","weight":2}]
     },
     {
       "id": "1.3", "title": "Name Every AWS Service", "tier": 1, "category": "shitpost", "weight": 3,

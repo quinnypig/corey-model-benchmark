@@ -5,7 +5,7 @@ from pathlib import Path
 
 from corey_bench.protocol import load_protocol
 from corey_bench.runner import RunConfig, RunStore
-from corey_bench.webapp import create_app
+from corey_bench.webapp import _pricing_label, create_app
 
 
 class FakeClient:
@@ -29,6 +29,14 @@ class FakeQueue:
 
 
 class WebAppTests(unittest.TestCase):
+    def test_roster_pricing_labels_are_per_million(self):
+        self.assertEqual(
+            _pricing_label({"prompt": "0.0000001", "completion": "0.0000002"}),
+            "$0.1 in / $0.2 out per 1M",
+        )
+        self.assertEqual(_pricing_label({"prompt": "0", "completion": "0"}), "free inference")
+        self.assertEqual(_pricing_label({}), "pricing unavailable")
+
     def test_dashboard_health_and_traversal(self):
         with tempfile.TemporaryDirectory() as directory:
             app = create_app(run_queue=FakeQueue(Path(directory)))
@@ -57,6 +65,24 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.status_code, 302)
             self.assertEqual(len(queue.submitted.eval_ids), 29)
             self.assertEqual(queue.submitted.conditions, ["weights-only", "search-enabled", "agentic"])
+
+    def test_cost_estimate_endpoint_uses_selected_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = create_app(run_queue=FakeQueue(Path(directory)))
+            app.config["TESTING"] = True
+            client = app.test_client()
+            client.get("/")
+            with client.session_transaction() as browser_session:
+                csrf = browser_session["csrf"]
+            response = client.post(
+                "/api/estimate",
+                json={"models": ["example/model"]},
+                headers={"X-CSRF-Token": csrf},
+            )
+            self.assertEqual(response.status_code, 200)
+            estimate = response.get_json()
+            self.assertEqual(estimate["models"][0]["id"], "example/model")
+            self.assertIn("expected", estimate["total"])
 
     def test_relative_runs_root_supports_report_download(self):
         previous = Path.cwd()

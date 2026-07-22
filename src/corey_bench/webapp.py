@@ -12,6 +12,7 @@ from typing import Any
 from flask import Flask, Response, abort, flash, jsonify, redirect, render_template, request, send_file, session, url_for
 
 from .cli import _load_dotenv
+from .costing import estimate_run_cost
 from .openrouter import OpenRouterError
 from .protocol import load_protocol
 from .reporting_v1 import build_report_data, write_v1_reports
@@ -39,6 +40,7 @@ class ModelCatalog:
                         model["created_label"] = datetime.fromtimestamp(created, timezone.utc).strftime("%b %d, %Y") if created else ""
                     except (TypeError, ValueError, OSError):
                         model["created_label"] = ""
+                    model["pricing_label"] = _pricing_label(model.get("pricing"))
                 self.models = sorted(
                     models,
                     key=lambda item: (-_model_created(item), str(item.get("name", "")).casefold(), item["id"]),
@@ -92,6 +94,32 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
     def api_models() -> Response:
         models = catalog.get(force=request.args.get("refresh") == "1")
         return jsonify({"data": models, "error": catalog.error})
+
+    @app.post("/api/estimate")
+    def api_estimate() -> Response:
+        payload = request.get_json(silent=True) or {}
+        models = list(dict.fromkeys(str(value).strip() for value in payload.get("models", []) if str(value).strip()))
+        if not models or len(models) > 10:
+            return jsonify({"error": "Choose between one and ten models"}), 400
+        repetitions_raw = payload.get("repetitions")
+        try:
+            repetitions = int(repetitions_raw) if repetitions_raw not in (None, "") else None
+            if repetitions is not None and not 1 <= repetitions <= 10:
+                raise ValueError
+            seed = int(payload.get("seed") or 8675309)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid repetitions or seed"}), 400
+        config = RunConfig(
+            models=models,
+            eval_ids=[definition.id for definition in suite.evals],
+            conditions=FULL_CONDITIONS,
+            repetitions=repetitions,
+            temperature=1.0,
+            reasoning=str(payload.get("reasoning") or "provider-default"),
+            seed=seed,
+        )
+        available = {model["id"]: model for model in catalog.get()}
+        return jsonify(estimate_run_cost(config, suite, available))
 
     @app.post("/runs")
     def create_run() -> Response:
@@ -261,6 +289,33 @@ def _model_created(model: dict[str, Any]) -> float:
         return float(model.get("created") or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _pricing_label(pricing: Any) -> str:
+    if not isinstance(pricing, dict) or "prompt" not in pricing or "completion" not in pricing:
+        return "pricing unavailable"
+    try:
+        prompt = float(pricing.get("prompt") or 0) * 1_000_000
+        completion = float(pricing.get("completion") or 0) * 1_000_000
+    except (TypeError, ValueError):
+        return "pricing unavailable"
+    if prompt < 0 or completion < 0:
+        return "pricing unavailable"
+    if prompt == 0 and completion == 0:
+        return "free inference"
+    return f"{_format_million_rate(prompt)} in / {_format_million_rate(completion)} out per 1M"
+
+
+def _format_million_rate(value: float) -> str:
+    if value >= 10:
+        rendered = f"{value:,.0f}"
+    elif value >= 1:
+        rendered = f"{value:,.2f}".rstrip("0").rstrip(".")
+    elif value >= 0.01:
+        rendered = f"{value:.3f}".rstrip("0").rstrip(".")
+    else:
+        rendered = f"{value:.5f}".rstrip("0").rstrip(".")
+    return f"${rendered}"
 
 
 def _run_dir(store: RunStore, run_id: str) -> Path:

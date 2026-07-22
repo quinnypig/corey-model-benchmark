@@ -5,7 +5,7 @@ from corey_bench.graders import grade_attempt
 from corey_bench.protocol import load_protocol
 
 
-SAFE_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="600" height="400" aria-label="platypus weeping over AWS bill">
+SAFE_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="600" height="400" aria-label="platypus crying over AWS bill">
 <text x="10" y="20">Platypus tear AWS bill</text><text x="10" y="50">Compute $10.00</text>
 <text x="10" y="70">Storage $20.00</text><text x="10" y="90">NAT $30.00</text><text x="10" y="110">Total $60.00</text>
 <ellipse cx="200" cy="200" rx="80" ry="40" fill="brown"/><path d="M0 0 L10 10" stroke="blue"/></svg>"""

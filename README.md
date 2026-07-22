@@ -59,9 +59,11 @@ runs/<run-id>/
 
 Three worker threads run by default; set `QUINNFERNO_WORKERS=1..8` to change that. HTTP 429 and 5xx responses use bounded exponential backoff and honor numeric `Retry-After`. One failed request creates a failed receipt and does not abort peer models. Runs left queued or running are recovered when the application starts.
 
-The run form shows estimated request volume and the server records a catalog-price estimate. A hard per-run dollar budget defaults to `$50`; once recorded spend reaches it, remaining jobs are cancelled. Provider-side key limits should still be used as the final guardrail. The estimate is directional, not a quote: reasoning tokens, search, retries, and models that produce their maximum output can move the total.
+The run form shows estimated request volume, live input/output prices per million tokens, and a low/likely/high spend range for every selected model. Preflight counting dispatches on OpenRouter's tokenizer-family metadata, uses the matching public GPT encoding or a calibrated nearest-family encoding, and widens the range for non-public native tokenizers. It models multi-turn context growth, output lengths, web-search charges, and one-to-ten agentic attempts. OpenRouter's native post-generation usage remains the billing authority.
 
-The full suite is intentionally large. Tier 7's coin test alone makes 300 fresh-context calls per model, and the integrity test makes 15 conversational calls per attempt. Start with the selected launch preset before checking every box.
+A hard per-run dollar budget defaults to `$50`; once recorded spend reaches it, remaining jobs are cancelled. Provider-side key limits should still be used as the final guardrail. The estimate is directional, not a quote: reasoning tokens, search behavior, retries, tiered pricing, and unusually long outputs can move the total.
+
+The full suite is intentionally large. Tier 7's coin test alone makes 300 fresh-context calls per model, and the integrity test makes 15 conversational calls per attempt. Every run includes the complete protocol; start with one inexpensive model and use the preflight range before queueing a ten-model comparison.
 
 ## Protocol behavior
 

@@ -4,7 +4,8 @@ FROM python:3.13-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     QUINNFERNO_RUNS=/data/runs \
-    QUINNFERNO_WORKERS=3
+    QUINNFERNO_WORKERS=3 \
+    TIKTOKEN_CACHE_DIR=/app/.cache/tiktoken
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends imagemagick librsvg2-bin ca-certificates \
@@ -17,6 +18,7 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 COPY benchmarks ./benchmarks
 RUN pip install --no-cache-dir . \
+    && python -c "import tiktoken; tiktoken.get_encoding('cl100k_base'); tiktoken.get_encoding('o200k_base')" \
     && chmod -R a+rX /app \
     && install -d -o 1001 -g 1001 /data/runs
 

@@ -118,7 +118,7 @@ class RunStore:
                         jobs.append(Job(run_id, model, eval_id, condition, repetition, attempt_id))
                         request_estimate += condition_request_count(definition, rendered[eval_id], condition)
         manifest = {
-            "protocol_version": "1.0",
+            "protocol_version": suite.version,
             "run_id": run_id,
             "created_at": utc_now(),
             "suite": {"name": suite.name, "version": suite.version, "source": str(suite.path)},
@@ -515,33 +515,6 @@ def build_queue_from_env(store: RunStore | None = None) -> RunQueue:
 
 
 def estimate_cost(config: RunConfig, suite: EvalSuite, catalog: dict[str, dict[str, Any]]) -> float:
-    total = 0.0
-    for model in config.models:
-        pricing = catalog.get(model, {}).get("pricing", {})
-        try:
-            prompt_rate = float(pricing.get("prompt") or 0)
-            completion_rate = float(pricing.get("completion") or 0)
-            request_rate = float(pricing.get("request") or 0)
-        except (TypeError, ValueError):
-            prompt_rate = completion_rate = request_rate = 0.0
-        for eval_id in config.eval_ids:
-            definition = suite.get(eval_id)
-            rendered = definition.render(config.seed)
-            repetitions = config.repetitions or definition.repetitions
-            if definition.execution == "repeated":
-                estimated_output = 3
-            else:
-                estimated_output = min(definition.max_tokens, 1800) * 0.55
-            prompt_chars = len(definition.prompt) + sum(map(len, rendered.prompts)) + sum(map(len, rendered.followups))
-            estimated_input = max(30, prompt_chars / 4 / max(1, request_count(definition, rendered)))
-            for condition in config.conditions:
-                allowed = condition in definition.conditions or (
-                    condition == "agentic" and eval_id in {"2.1", "2.2"}
-                )
-                if not allowed:
-                    continue
-                calls = condition_request_count(definition, rendered, condition) * repetitions
-                total += calls * (request_rate + estimated_input * prompt_rate + estimated_output * completion_rate)
-                if condition == "search-enabled":
-                    total += calls * 0.005
-    return round(total, 4)
+    from .costing import estimate_run_cost
+
+    return float(estimate_run_cost(config, suite, catalog)["total"]["expected"])
