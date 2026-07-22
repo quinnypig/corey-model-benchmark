@@ -110,7 +110,12 @@ def _contexts(
     return [_count_text(rendered.messages[0]["content"], profile) + overhead]
 
 
-def estimate_model_cost(config: "RunConfig", suite: EvalSuite, model: dict[str, Any]) -> dict[str, Any]:
+def estimate_model_cost(
+    config: "RunConfig",
+    suite: EvalSuite,
+    model: dict[str, Any],
+    judge_model: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     profile = _profile(model)
     family, encoding, _, uncertainty = profile
     pricing = model.get("pricing") if isinstance(model.get("pricing"), dict) else {}
@@ -166,6 +171,9 @@ def estimate_model_cost(config: "RunConfig", suite: EvalSuite, model: dict[str, 
                 token_totals[band]["input"] += input_tokens
                 token_totals[band]["output"] += output_total
 
+    review_cost = _estimate_review_cost(config, suite, judge_model) if judge_model else {band: 0.0 for band in totals}
+    for band in totals:
+        totals[band] += review_cost[band]
     priced = any((prompt_rate, completion_rate, request_rate, _price(pricing, "web_search")))
     return {
         "id": model.get("id"),
@@ -175,12 +183,19 @@ def estimate_model_cost(config: "RunConfig", suite: EvalSuite, model: dict[str, 
         "uncertainty_percent": round(uncertainty * 100),
         "priced": priced,
         "cost": {key: round(value, 4) for key, value in totals.items()},
+        "review_cost": {key: round(value, 4) for key, value in review_cost.items()},
         "tokens": token_totals,
     }
 
 
-def estimate_run_cost(config: "RunConfig", suite: EvalSuite, catalog: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    models = [estimate_model_cost(config, suite, catalog[model_id]) for model_id in config.models if model_id in catalog]
+def estimate_run_cost(
+    config: "RunConfig",
+    suite: EvalSuite,
+    catalog: dict[str, dict[str, Any]],
+    judge_model_id: str | None = None,
+) -> dict[str, Any]:
+    judge_model = catalog.get(judge_model_id) if judge_model_id else None
+    models = [estimate_model_cost(config, suite, catalog[model_id], judge_model) for model_id in config.models if model_id in catalog]
     total = {
         band: round(sum(model["cost"][band] for model in models), 4)
         for band in ("low", "expected", "high")
@@ -188,6 +203,60 @@ def estimate_run_cost(config: "RunConfig", suite: EvalSuite, catalog: dict[str, 
     return {
         "models": models,
         "total": total,
+        "judge_model": judge_model_id if judge_model else None,
         "missing": [model_id for model_id in config.models if model_id not in catalog],
-        "method": "Live OpenRouter prices; tokenizer-family preflight; output/search/agentic range",
+        "method": "Live OpenRouter prices; tokenizer-family preflight; output/search/agentic/review range",
     }
+
+
+def _estimate_review_cost(
+    config: "RunConfig",
+    suite: EvalSuite,
+    judge_model: dict[str, Any],
+) -> dict[str, float]:
+    profile = _profile(judge_model)
+    pricing = judge_model.get("pricing") if isinstance(judge_model.get("pricing"), dict) else {}
+    prompt_rate = _price(pricing, "prompt")
+    completion_rate = _price(pricing, "completion")
+    request_rate = _price(pricing, "request")
+    reasoning_rate = _price(pricing, "internal_reasoning")
+    uncertainty = profile[3]
+    totals = {"low": 0.0, "expected": 0.0, "high": 0.0}
+    for eval_id in config.eval_ids:
+        definition = suite.get(eval_id)
+        if not definition.human_review:
+            continue
+        rendered = definition.render(config.seed)
+        repetitions = config.repetitions or definition.repetitions
+        output_sizes = _output_sizes(definition)
+        for condition in config.conditions:
+            allowed = condition in definition.conditions or (condition == "agentic" and eval_id in {"2.1", "2.2"})
+            if not allowed:
+                continue
+            for band, candidate_tokens, review_tokens, agentic_turns in (
+                ("low", output_sizes[0], 250, 1),
+                ("expected", output_sizes[1], 450, 2),
+                ("high", output_sizes[2], 1000, 10),
+            ):
+                if condition == "agentic":
+                    response_count = agentic_turns
+                elif definition.execution == "independent":
+                    response_count = len(rendered.prompts)
+                elif definition.execution == "repeated":
+                    response_count = definition.sample_count
+                elif definition.execution == "multi_turn":
+                    response_count = 1 + len(rendered.followups)
+                else:
+                    response_count = 1
+                overhead = 600
+                input_tokens = candidate_tokens * response_count + overhead
+                factor = 1 - uncertainty if band == "low" else 1 + uncertainty if band == "high" else 1
+                input_tokens = math.ceil(input_tokens * factor)
+                reasoning_cost = 0.0
+                if reasoning_rate:
+                    reasoning_factor = 0.1 if band == "low" else 0.5 if band == "expected" else 1.0
+                    reasoning_cost = review_tokens * reasoning_factor * reasoning_rate
+                totals[band] += repetitions * (
+                    input_tokens * prompt_rate + review_tokens * completion_rate + request_rate + reasoning_cost
+                )
+    return totals

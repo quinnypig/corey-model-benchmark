@@ -5,8 +5,9 @@ Quinnferno is the web application and durable job runner for **The Quinn Eval Su
 The application uses OpenRouter as its provider. It discovers every model available to the configured key, queues comparisons of up to ten models, survives page closes and process restarts, retains raw receipts, and produces:
 
 - a fixed Markdown and JSON scorecard;
-- per-model comparison charts with cost and resolved-score coverage;
-- blinded human and pairwise review queues;
+- persistent model cards and a cross-run comparison table;
+- response browsing by model or eval, plus per-model JSONL and ZIP evidence exports;
+- frontier-model rubric reviews, blinded human overrides, and pairwise review queues;
 - a safely rendered platypus gallery;
 - per-attempt provider, resolved-model, latency, token, retry, and cost metadata.
 
@@ -49,7 +50,8 @@ runs/<run-id>/
   manifest.json       frozen treatments, variants, rendered prompts, hashes, jobs
   state.json          atomic queue/progress state
   results.jsonl       append-only attempt receipts
-  reviews.jsonl       append-only blinded human judgments
+  reviews.jsonl       append-only model and blinded-human rubric judgments
+  judge-errors.jsonl  non-fatal automated-review failures
   comparisons.jsonl   append-only pairwise votes
   raw/                verbatim response archives
   artifacts/          sanitized SVG and PNG previews; inert HTML source
@@ -57,7 +59,9 @@ runs/<run-id>/
   report.json
 ```
 
-Three worker threads run by default; set `QUINNFERNO_WORKERS=1..8` to change that. HTTP 429 and 5xx responses use bounded exponential backoff and honor numeric `Retry-After`. One failed request creates a failed receipt and does not abort peer models. Runs left queued or running are recovered when the application starts.
+Twelve worker threads run by default. `QUINNFERNO_WORKERS=1..24` controls global concurrency and `QUINNFERNO_PER_MODEL_WORKERS` defaults to three, preventing one provider route from consuming every slot. Jobs are interleaved across models. HTTP 429 and 5xx responses use bounded exponential backoff and honor numeric `Retry-After`. One failed request creates a failed receipt and does not abort peer models. Runs left queued or running are recovered when the application starts.
+
+Human-required attempts are asynchronously scored against their frozen rubric by `openai/gpt-5.6-luna-pro` by default. Set `QUINNFERNO_JUDGE_MODEL` and `QUINNFERNO_JUDGE_WORKERS` to change or disable that pool. The candidate model identity is omitted from the judging prompt; the judge model, rationale, criterion scores, usage, and cost are retained. A later blinded human review takes precedence over the model review.
 
 The run form shows estimated request volume, live input/output prices per million tokens, and a low/likely/high spend range for every selected model. Preflight counting dispatches on OpenRouter's tokenizer-family metadata, uses the matching public GPT encoding or a calibrated nearest-family encoding, and widens the range for non-public native tokenizers. It models multi-turn context growth, output lengths, web-search charges, and one-to-ten agentic attempts. OpenRouter's native post-generation usage remains the billing authority.
 
@@ -72,7 +76,7 @@ The full suite is intentionally large. Tier 7's coin test alone makes 300 fresh-
 - Exact model ID, resolved model, provider route, requested settings, rendered-prompt SHA-256, date, and full usage are retained.
 - Factual/security headline aggregation is minimum/all-pass; creative aggregation is best-of-three but every attempt and its cost remains visible.
 - Calibration uses a strict final `Confidence: N%` line. Missing confidence is missing, never silently converted to zero.
-- Human-required and deferred scores remain unresolved. Quinnferno reports provisional points over resolved weight and emits `/100` only after all weighted judgments resolve.
+- Human-required scores remain unresolved until a model or human rubric review lands; deferred scores remain unresolved until their registered outcome exists. Quinnferno reports provisional points over resolved weight and emits `/100` only after all weighted judgments resolve.
 - Tier 7 never contributes to `/100`.
 
 The frozen weighting policy is encoded in `benchmarks/quinn_v1.json` and validated to total exactly 100 points across Tiers 1–6.

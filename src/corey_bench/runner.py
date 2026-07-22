@@ -14,6 +14,7 @@ from typing import Any
 
 from .artifacts import ArtifactError, extract_code, validate_svg, write_svg_preview
 from .graders import grade_attempt
+from .judging import judge_messages, parse_judge_output
 from .openrouter import OpenRouterClient, OpenRouterError
 from .protocol import EvalDefinition, EvalSuite, RenderedEval, load_protocol
 
@@ -80,6 +81,12 @@ class Job:
     attempt_id: str
 
 
+@dataclass(frozen=True)
+class ReviewJob:
+    run_id: str
+    attempt_id: str
+
+
 class RunStore:
     def __init__(self, root: str | Path = "runs") -> None:
         self.root = Path(root)
@@ -103,20 +110,24 @@ class RunStore:
         rendered = {eval_id: suite.get(eval_id).render(config.seed) for eval_id in config.eval_ids}
         jobs: list[Job] = []
         request_estimate = 0
-        for model in config.models:
-            for eval_id in config.eval_ids:
-                definition = suite.get(eval_id)
-                repetitions = config.repetitions or definition.repetitions
-                for condition in config.conditions:
-                    if condition not in definition.conditions and condition != "agentic":
-                        continue
-                    if condition == "agentic" and eval_id not in {"2.1", "2.2"}:
-                        continue
-                    for repetition in range(1, repetitions + 1):
+        # Interleave models so a large run makes visible progress across the
+        # whole roster instead of exhausting one provider before starting the next.
+        for eval_id in config.eval_ids:
+            definition = suite.get(eval_id)
+            repetitions = config.repetitions or definition.repetitions
+            for condition in config.conditions:
+                if condition not in definition.conditions and condition != "agentic":
+                    continue
+                if condition == "agentic" and eval_id not in {"2.1", "2.2"}:
+                    continue
+                for repetition in range(1, repetitions + 1):
+                    for model in config.models:
                         key = f"{run_id}\0{model}\0{eval_id}\0{condition}\0{repetition}"
                         attempt_id = hashlib.sha256(key.encode()).hexdigest()[:20]
                         jobs.append(Job(run_id, model, eval_id, condition, repetition, attempt_id))
                         request_estimate += condition_request_count(definition, rendered[eval_id], condition)
+                        if definition.human_review:
+                            request_estimate += 1
         manifest = {
             "protocol_version": suite.version,
             "run_id": run_id,
@@ -219,6 +230,7 @@ def suite_request_count(
     conditions: tuple[str, ...] = ("weights-only", "search-enabled", "agentic"),
     seed: int = 8675309,
     repetitions: int | None = None,
+    include_reviews: bool = True,
 ) -> int:
     """Return the full-protocol maximum request count for one model."""
     total = 0
@@ -230,6 +242,8 @@ def suite_request_count(
             )
             if allowed:
                 total += condition_request_count(definition, rendered, condition) * (repetitions or definition.repetitions)
+                if include_reviews and definition.human_review:
+                    total += repetitions or definition.repetitions
     return total
 
 
@@ -241,15 +255,25 @@ class RunQueue:
         store: RunStore | None = None,
         suite: EvalSuite | None = None,
         workers: int = 3,
+        per_model_workers: int = 3,
+        judge_model: str = "openai/gpt-5.6-luna-pro",
+        judge_workers: int = 2,
         timeout: float = 300,
         attempts: int = 5,
     ) -> None:
         self.store = store or RunStore()
         self.suite = suite or load_protocol()
         self.client = OpenRouterClient(api_key, timeout=timeout, attempts=attempts)
-        self.workers = max(1, min(int(workers), 8))
+        self.workers = max(1, min(int(workers), 24))
+        self.per_model_workers = max(1, min(int(per_model_workers), self.workers))
+        self.judge_model = judge_model
+        self.judge_workers = max(0, min(int(judge_workers), 4))
         self._queue: queue.Queue[Job | None] = queue.Queue()
+        self._review_queue: queue.Queue[ReviewJob | None] = queue.Queue()
         self._threads: list[threading.Thread] = []
+        self._judge_threads: list[threading.Thread] = []
+        self._model_limits: dict[str, threading.BoundedSemaphore] = {}
+        self._model_limits_guard = threading.Lock()
         self._started = False
 
     def start(self) -> None:
@@ -261,6 +285,11 @@ class RunQueue:
             thread.start()
             self._threads.append(thread)
         self.recover()
+        for number in range(self.judge_workers):
+            thread = threading.Thread(target=self._judge_worker, name=f"quinnferno-judge-{number+1}", daemon=True)
+            thread.start()
+            self._judge_threads.append(thread)
+        self.recover_reviews()
 
     def submit(self, config: RunConfig) -> str:
         if len(config.models) > 10:
@@ -272,7 +301,7 @@ class RunQueue:
         missing = [model for model in config.models if model not in available]
         if missing:
             raise OpenRouterError("Requested model ID(s) are unavailable for this API key: " + ", ".join(missing))
-        config = replace(config, estimated_cost_usd=estimate_cost(config, self.suite, available))
+        config = replace(config, estimated_cost_usd=estimate_cost(config, self.suite, available, self.judge_model if self.judge_workers else None))
         run_id, jobs = self.store.create(config, self.suite)
         for job in jobs:
             self._queue.put(job)
@@ -289,6 +318,18 @@ class RunQueue:
             for raw in manifest.get("jobs", []):
                 if raw.get("attempt_id") not in completed:
                     self._queue.put(Job(**raw))
+
+    def recover_reviews(self) -> None:
+        reviewed: set[tuple[str, str]] = set()
+        for state in self.store.recent():
+            run_id = state["run_id"]
+            for review in read_jsonl(self.store.run_dir(run_id) / "reviews.jsonl"):
+                if review.get("reviewer_type") == "model":
+                    reviewed.add((run_id, str(review.get("attempt_id"))))
+            for result in self.store.results(run_id):
+                key = (run_id, str(result.get("attempt_id")))
+                if _can_model_review(result) and key not in reviewed:
+                    self._review_queue.put(ReviewJob(*key))
 
     def cancel(self, run_id: str) -> None:
         self.store.update_state(run_id, cancel_requested=True, status="cancelling")
@@ -318,6 +359,8 @@ class RunQueue:
                 self.store.append_result(job.run_id, result)
                 self.store.mutate_state(job.run_id, lambda value: _finish_job(value, result.get("status") == "ok", job.attempt_id))
                 self._refresh_report(job.run_id)
+                if _can_model_review(result):
+                    self._review_queue.put(ReviewJob(job.run_id, job.attempt_id))
             except Exception as exc:  # worker containment boundary
                 try:
                     result = self._error_result(job, exc)
@@ -328,6 +371,76 @@ class RunQueue:
                     pass
             finally:
                 self._queue.task_done()
+
+    def _judge_worker(self) -> None:
+        while True:
+            job = self._review_queue.get()
+            if job is None:
+                return
+            try:
+                self._execute_review(job)
+            except Exception as exc:
+                append_jsonl(
+                    self.store.run_dir(job.run_id) / "judge-errors.jsonl",
+                    {"attempt_id": job.attempt_id, "judge_model": self.judge_model, "at": utc_now(), "error": f"{type(exc).__name__}: {exc}"},
+                    self.store.lock(job.run_id),
+                )
+            finally:
+                self._review_queue.task_done()
+
+    def _execute_review(self, job: ReviewJob) -> None:
+        reviews_path = self.store.run_dir(job.run_id) / "reviews.jsonl"
+        if any(
+            row.get("attempt_id") == job.attempt_id and row.get("reviewer_type") == "model"
+            for row in read_jsonl(reviews_path)
+        ):
+            return
+        result = next((row for row in self.store.results(job.run_id) if row.get("attempt_id") == job.attempt_id), None)
+        if not result or not _can_model_review(result):
+            return
+        manifest = self.store.manifest(job.run_id)
+        budget = manifest.get("config", {}).get("max_budget_usd")
+        inference_spend = sum(float(row.get("cost_usd") or 0) for row in self.store.results(job.run_id))
+        review_spend = sum(float(row.get("cost_usd") or 0) for row in read_jsonl(reviews_path) if row.get("reviewer_type") == "model")
+        if budget is not None and inference_spend + review_spend >= float(budget):
+            append_jsonl(
+                reviews_path,
+                {
+                    "attempt_id": job.attempt_id, "reviewed_at": utc_now(), "reviewer_type": "model",
+                    "judge_model": self.judge_model, "status": "skipped_budget", "cost_usd": 0,
+                },
+                self.store.lock(job.run_id),
+            )
+            return
+        eval_manifest = next(row for row in manifest.get("evals", []) if row.get("id") == result.get("eval_id"))
+        with self._model_limit(self.judge_model):
+            completion = self.client.complete_messages(
+                model=self.judge_model,
+                messages=judge_messages(eval_manifest=eval_manifest, result=result),
+                max_tokens=1400,
+                temperature=0,
+                seed=8675309,
+                reasoning="high",
+            )
+        judged = parse_judge_output(completion.text)
+        append_jsonl(
+            reviews_path,
+            {
+                "attempt_id": job.attempt_id,
+                "reviewed_at": utc_now(),
+                "reviewer_type": "model",
+                "judge_model": self.judge_model,
+                "score": judged["score"],
+                "verdict": judged["verdict"],
+                "rationale": judged["rationale"],
+                "rubric_scores": judged["rubric_scores"],
+                "usage": completion.usage,
+                "cost_usd": float(completion.usage.get("cost") or 0),
+                "response_id": completion.response_id,
+            },
+            self.store.lock(job.run_id),
+        )
+        self._refresh_report(job.run_id)
 
     def _finish_skipped(self, job: Job) -> None:
         result = self._error_result(job, RuntimeError("Run cancelled"), status="cancelled")
@@ -423,10 +536,15 @@ class RunQueue:
     ) -> Any:
         seed = None if force_no_seed or config.get("seed") is None else int(config["seed"]) + job.repetition * 1000 + sample_index
         condition = "weights-only" if job.condition == "agentic" else job.condition
-        return self.client.complete_messages(
-            model=job.model, messages=messages, max_tokens=definition.max_tokens,
-            temperature=config.get("temperature"), seed=seed, reasoning=config["reasoning"], condition=condition,
-        )
+        with self._model_limit(job.model):
+            return self.client.complete_messages(
+                model=job.model, messages=messages, max_tokens=definition.max_tokens,
+                temperature=config.get("temperature"), seed=seed, reasoning=config["reasoning"], condition=condition,
+            )
+
+    def _model_limit(self, model: str) -> threading.BoundedSemaphore:
+        with self._model_limits_guard:
+            return self._model_limits.setdefault(model, threading.BoundedSemaphore(self.per_model_workers))
 
     def _artifacts(self, job: Job, definition: EvalDefinition, outputs: list[str], grade: dict[str, Any]) -> list[dict[str, Any]]:
         if not definition.renderer or not outputs:
@@ -510,11 +628,34 @@ def build_queue_from_env(store: RunStore | None = None) -> RunQueue:
     key = os.environ.get("OPENROUTER_API_KEY", "")
     if not key:
         raise ValueError("OPENROUTER_API_KEY is required")
-    workers = int(os.environ.get("QUINNFERNO_WORKERS", "3"))
-    return RunQueue(key, store=store, workers=workers)
+    workers = int(os.environ.get("QUINNFERNO_WORKERS", "12"))
+    per_model_workers = int(os.environ.get("QUINNFERNO_PER_MODEL_WORKERS", "3"))
+    judge_model = os.environ.get("QUINNFERNO_JUDGE_MODEL", "openai/gpt-5.6-luna-pro")
+    judge_workers = int(os.environ.get("QUINNFERNO_JUDGE_WORKERS", "2"))
+    return RunQueue(
+        key,
+        store=store,
+        workers=workers,
+        per_model_workers=per_model_workers,
+        judge_model=judge_model,
+        judge_workers=judge_workers,
+    )
 
 
-def estimate_cost(config: RunConfig, suite: EvalSuite, catalog: dict[str, dict[str, Any]]) -> float:
+def _can_model_review(result: dict[str, Any]) -> bool:
+    return (
+        result.get("status") == "ok"
+        and bool(result.get("grade", {}).get("human_required"))
+        and bool(result.get("attempt_id"))
+    )
+
+
+def estimate_cost(
+    config: RunConfig,
+    suite: EvalSuite,
+    catalog: dict[str, dict[str, Any]],
+    judge_model: str | None = None,
+) -> float:
     from .costing import estimate_run_cost
 
-    return float(estimate_run_cost(config, suite, catalog)["total"]["expected"])
+    return float(estimate_run_cost(config, suite, catalog, judge_model)["total"]["expected"])

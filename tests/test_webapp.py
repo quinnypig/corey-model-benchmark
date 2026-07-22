@@ -100,6 +100,9 @@ class WebAppTests(unittest.TestCase):
                         "attempt_id": jobs[0].attempt_id, "status": "ok", "model": "example/model",
                         "eval_id": "3.2", "condition": "weights-only", "cost_usd": 0,
                         "latency_seconds": 1, "usage": {},
+                        "response": "ALLOWED — same-account identity policy is sufficient.",
+                        "responses": ["ALLOWED — same-account identity policy is sufficient."],
+                        "turns": [{"index": 1, "messages": [{"role": "user", "content": "Is it allowed?"}], "response": "ALLOWED — same-account identity policy is sufficient.", "usage": {"cost": 0.001}}],
                         "grade": {"score": 1, "pass": True, "human_required": False, "verdict": "pass"},
                     },
                 )
@@ -108,6 +111,16 @@ class WebAppTests(unittest.TestCase):
                 response = app.test_client().get(f"/runs/{run_id}/report.json")
                 self.assertEqual(response.status_code, 200)
                 self.assertIn(b'"models"', response.data)
+                client = app.test_client()
+                self.assertIn(b"Tested model roster", client.get("/models").data)
+                self.assertIn(b"Capability profile", client.get("/models/example/model").data)
+                self.assertIn(b"ALLOWED", client.get("/responses?model=example/model&eval=3.2").data)
+                exported = client.get("/models/example/model/responses.jsonl")
+                self.assertEqual(exported.status_code, 200)
+                self.assertIn(b'"question": "Is it allowed?"', exported.data)
+                archive = client.get("/models/example/model/responses.zip")
+                self.assertEqual(archive.status_code, 200)
+                self.assertEqual(archive.mimetype, "application/zip")
             finally:
                 os.chdir(previous)
 

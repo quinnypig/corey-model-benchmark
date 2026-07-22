@@ -39,6 +39,21 @@ class GraderV1Tests(unittest.TestCase):
         with self.assertRaises(ArtifactError):
             validate_svg('<svg xmlns="http://www.w3.org/2000/svg"><rect style="background:url(https://bad.example/x)"/></svg>')
 
+    def test_safe_filter_primitives_render_from_gemini_style_svg(self):
+        safe, _ = validate_svg(
+            '''```xml
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100%" height="100%">
+  <defs><filter id="glow"><feGaussianBlur stdDeviation="8" result="blur"/><feComposite in="SourceGraphic" in2="blur" operator="over"/></filter></defs>
+  <circle cx="50" cy="50" r="20" fill="#38bdf8" filter="url(#glow)"/>
+</svg>
+```'''
+        )
+        self.assertIn("feGaussianBlur", safe)
+
+    def test_unclosed_svg_reports_truncation(self):
+        with self.assertRaisesRegex(ArtifactError, "Truncated SVG"):
+            validate_svg('```xml\n<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"')
+
     def test_iam_requires_all_verdicts_and_reasons(self):
         answer = "\n".join(
             [

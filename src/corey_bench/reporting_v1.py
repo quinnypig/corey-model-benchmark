@@ -11,13 +11,23 @@ from .runner import read_jsonl
 
 
 def _review_scores(run_dir: Path) -> dict[str, float]:
-    latest: dict[str, float] = {}
+    model_scores: dict[str, float] = {}
+    human_scores: dict[str, float] = {}
     for row in read_jsonl(run_dir / "reviews.jsonl"):
         attempt_id = row.get("attempt_id")
         score = row.get("score")
         if attempt_id and isinstance(score, (int, float)):
-            latest[str(attempt_id)] = max(0.0, min(1.0, float(score)))
-    return latest
+            target = human_scores if row.get("reviewer_type", "human") == "human" else model_scores
+            target[str(attempt_id)] = max(0.0, min(1.0, float(score)))
+    return {**model_scores, **human_scores}
+
+
+def _review_costs(run_dir: Path) -> dict[str, float]:
+    costs: dict[str, float] = defaultdict(float)
+    for row in read_jsonl(run_dir / "reviews.jsonl"):
+        if row.get("reviewer_type") == "model" and row.get("attempt_id"):
+            costs[str(row["attempt_id"])] += float(row.get("cost_usd") or row.get("usage", {}).get("cost") or 0)
+    return costs
 
 
 def _attempt_score(row: dict[str, Any], reviews: dict[str, float]) -> tuple[float | None, bool]:
@@ -48,6 +58,7 @@ def build_report_data(run_dir: Path, suite: EvalSuite | None = None) -> dict[str
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     results = read_jsonl(run_dir / "results.jsonl")
     reviews = _review_scores(run_dir)
+    review_costs = _review_costs(run_dir)
     models = manifest.get("models", manifest.get("config", {}).get("models", []))
     selected_ids = [item["id"] for item in manifest.get("evals", [])]
     grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -96,7 +107,9 @@ def build_report_data(run_dir: Path, suite: EvalSuite | None = None) -> dict[str
                 if condition == "weights-only" and definition.tier < 7 and definition.status != "alternate" and resolved and score is not None:
                     weighted_points += score * definition.weight
                     resolved_weight += definition.weight
-        total_cost = sum(float(row.get("cost_usd") or row.get("usage", {}).get("cost") or 0) for row in attempts)
+        inference_cost = sum(float(row.get("cost_usd") or row.get("usage", {}).get("cost") or 0) for row in attempts)
+        review_cost = sum(review_costs.get(str(row.get("attempt_id")), 0) for row in attempts)
+        total_cost = inference_cost + review_cost
         latencies = [float(row.get("latency_seconds", 0)) for row in attempts if row.get("status") == "ok"]
         total_tokens = sum(int(row.get("usage", {}).get("total_tokens") or 0) for row in attempts)
         model_rows.append(
@@ -104,6 +117,7 @@ def build_report_data(run_dir: Path, suite: EvalSuite | None = None) -> dict[str
                 "model": model, "evals": eval_rows, "weighted_points": weighted_points,
                 "resolved_weight": resolved_weight, "final_score": weighted_points if abs(resolved_weight - 100) < 1e-9 else None,
                 "total_cost": total_cost,
+                "inference_cost": inference_cost, "review_cost": review_cost,
                 "dollars_per_point": total_cost / weighted_points if weighted_points > 0 else None,
                 "median_latency": median(latencies) if latencies else None, "total_tokens": total_tokens,
                 "completed_attempts": len(attempts),

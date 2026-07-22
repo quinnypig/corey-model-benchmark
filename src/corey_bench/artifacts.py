@@ -17,6 +17,7 @@ class ArtifactError(ValueError):
 SVG_TAGS = {
     "svg", "g", "path", "circle", "ellipse", "rect", "line", "polyline", "polygon",
     "text", "tspan", "defs", "linearGradient", "radialGradient", "stop", "clipPath", "mask",
+    "filter", "feDropShadow", "feGaussianBlur", "feComposite",
 }
 SVG_ATTRS = {
     "xmlns", "version", "width", "height", "viewBox", "x", "y", "x1", "x2", "y1", "y2", "cx", "cy",
@@ -24,6 +25,7 @@ SVG_ATTRS = {
     "stroke-linecap", "stroke-linejoin", "stroke-dasharray", "opacity", "transform", "font-family",
     "font-size", "font-weight", "text-anchor", "dominant-baseline", "offset", "stop-color",
     "stop-opacity", "clip-path", "mask", "id", "class", "style", "aria-label", "role",
+    "filter", "dx", "dy", "stdDeviation", "flood-color", "flood-opacity", "result", "in", "in2", "operator",
 }
 SVG_STYLE_PROPERTIES = {
     "fill", "fill-opacity", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin",
@@ -50,6 +52,8 @@ def validate_svg(response: str) -> tuple[str, dict[str, Any]]:
     document = re.search(r"<svg\b.*?</svg\s*>", svg, re.I | re.S)
     if document:
         svg = document.group(0)
+    elif re.search(r"<svg\b", svg, re.I) and not re.search(r"</svg\s*>", svg, re.I):
+        raise ArtifactError("Truncated SVG: the model output ended before </svg> (usually max_tokens)")
     encoded = svg.encode("utf-8")
     if len(encoded) > 750_000:
         raise ArtifactError("SVG exceeds the 750 KB safety limit")

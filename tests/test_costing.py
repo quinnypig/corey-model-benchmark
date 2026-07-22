@@ -39,6 +39,18 @@ class CostEstimatorTests(unittest.TestCase):
         self.assertEqual(estimate["missing"], ["missing/model"])
         self.assertEqual(estimate["total"]["expected"], 0)
 
+    def test_frontier_judge_cost_is_included(self):
+        suite = load_protocol()
+        config = RunConfig(models=["candidate/model"], eval_ids=["1.1"], conditions=["weights-only"])
+        catalog = {
+            "candidate/model": {"id": "candidate/model", "architecture": {"tokenizer": "GPT"}, "pricing": {"prompt": "0.000001", "completion": "0.000002"}},
+            "judge/model": {"id": "judge/model", "architecture": {"tokenizer": "GPT"}, "pricing": {"prompt": "0.000001", "completion": "0.000006"}},
+        }
+        without_judge = estimate_run_cost(config, suite, catalog)
+        with_judge = estimate_run_cost(config, suite, catalog, "judge/model")
+        self.assertGreater(with_judge["total"]["expected"], without_judge["total"]["expected"])
+        self.assertGreater(with_judge["models"][0]["review_cost"]["expected"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

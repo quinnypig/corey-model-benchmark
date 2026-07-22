@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 import os
 import secrets
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,9 +15,11 @@ from flask import Flask, Response, abort, flash, jsonify, redirect, render_templ
 
 from .cli import _load_dotenv
 from .costing import estimate_run_cost
+from .model_cards import build_model_cards
 from .openrouter import OpenRouterError
 from .protocol import load_protocol
 from .reporting_v1 import build_report_data, write_v1_reports
+from .responses import response_records
 from .runner import RunConfig, RunQueue, RunStore, append_jsonl, build_queue_from_env, suite_request_count
 
 
@@ -95,6 +99,83 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
         models = catalog.get(force=request.args.get("refresh") == "1")
         return jsonify({"data": models, "error": catalog.error})
 
+    @app.get("/models")
+    def model_index() -> str:
+        cards = build_model_cards(store, suite, catalog.get())
+        return render_template(
+            "models.html",
+            cards=cards,
+            run_count=len({run["run_id"] for card in cards for run in card["runs"]}),
+            attempt_count=sum(card["total_attempts"] for card in cards),
+            total_cost=sum(card["total_cost"] for card in cards),
+        )
+
+    @app.get("/models/<path:model_id>")
+    def model_detail(model_id: str) -> str:
+        cards = build_model_cards(store, suite, catalog.get())
+        card = next((item for item in cards if item["id"] == model_id), None)
+        if card is None:
+            abort(404)
+        platypus_cards = []
+        for run in card["runs"]:
+            try:
+                for row in store.results(run["run_id"]):
+                    if row.get("model") == model_id and row.get("eval_id") == "1.2":
+                        platypus_cards.append({"run_id": run["run_id"], **row})
+            except (OSError, ValueError):
+                continue
+        return render_template("model.html", card=card, platypus_cards=platypus_cards[:6])
+
+    @app.get("/models/<path:model_id>/responses.jsonl")
+    def model_responses_jsonl(model_id: str) -> Response:
+        _require_tested_model(store, suite, model_id)
+        rows = response_records(store, suite, model_id=model_id)
+        body = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+        filename = _download_name(model_id) + "-responses.jsonl"
+        return Response(
+            body,
+            mimetype="application/x-ndjson",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @app.get("/models/<path:model_id>/responses.zip")
+    def model_responses_zip(model_id: str) -> Response:
+        card = _require_tested_model(store, suite, model_id)
+        rows = response_records(store, suite, model_id=model_id)
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+            bundle.writestr("model-card.json", json.dumps(card, indent=2, ensure_ascii=False, default=str) + "\n")
+            bundle.writestr("responses.jsonl", "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
+            for row in rows:
+                name = f"raw/{row['run_id']}/{row['attempt_id']}/response-{int(row['turn']):03}.txt"
+                bundle.writestr(name, str(row.get("response") or ""))
+        archive.seek(0)
+        return send_file(
+            archive,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=_download_name(model_id) + "-evidence.zip",
+        )
+
+    @app.get("/responses")
+    def responses() -> str:
+        model_id = request.args.get("model") or None
+        eval_id = request.args.get("eval") or None
+        all_rows = response_records(store, suite, model_id=model_id, eval_id=eval_id)
+        try:
+            page = max(1, int(request.args.get("page", "1")))
+        except ValueError:
+            page = 1
+        per_page = 40
+        start = (page - 1) * per_page
+        return render_template(
+            "responses.html",
+            rows=all_rows[start:start + per_page], total=len(all_rows), page=page,
+            pages=max(1, (len(all_rows) + per_page - 1) // per_page),
+            selected_model=model_id, selected_eval=eval_id,
+            models=build_model_cards(store, suite, catalog.get()), evals=suite.evals,
+        )
+
     @app.post("/api/estimate")
     def api_estimate() -> Response:
         payload = request.get_json(silent=True) or {}
@@ -119,7 +200,8 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
             seed=seed,
         )
         available = {model["id"]: model for model in catalog.get()}
-        return jsonify(estimate_run_cost(config, suite, available))
+        judge_model = getattr(queue_manager, "judge_model", None) if getattr(queue_manager, "judge_workers", 0) else None
+        return jsonify(estimate_run_cost(config, suite, available, judge_model))
 
     @app.post("/runs")
     def create_run() -> Response:
@@ -182,7 +264,11 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
     @app.get("/runs/<run_id>/review")
     def review(run_id: str) -> str:
         run_dir = _run_dir(store, run_id)
-        reviews = {row.get("attempt_id"): row for row in _read_reviews(run_dir / "reviews.jsonl")}
+        reviews = {
+            row.get("attempt_id"): row
+            for row in _read_reviews(run_dir / "reviews.jsonl")
+            if row.get("reviewer_type", "human") == "human"
+        }
         candidates = []
         for row in store.results(run_id):
             if row.get("status") == "ok" and row.get("grade", {}).get("human_required") and row.get("attempt_id") not in reviews:
@@ -201,7 +287,7 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
         score = max(0, min(100, int(request.form.get("score", "0")))) / 100
         append_jsonl(
             run_dir / "reviews.jsonl",
-            {"attempt_id": attempt_id, "reviewed_at": _now(), "score": score, "notes": request.form.get("notes", ""), "verdict": request.form.get("verdict", "")[:120]},
+            {"attempt_id": attempt_id, "reviewed_at": _now(), "reviewer_type": "human", "score": score, "notes": request.form.get("notes", ""), "verdict": request.form.get("verdict", "")[:120]},
         )
         write_v1_reports(run_dir, suite)
         return redirect(url_for("review", run_id=run_id))
@@ -275,7 +361,12 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
 
     @app.get("/healthz")
     def health() -> Response:
-        return jsonify({"status": "ok", "queue_depth": queue_manager._queue.qsize()})
+        return jsonify({
+            "status": "ok", "queue_depth": queue_manager._queue.qsize(),
+            "review_queue_depth": queue_manager._review_queue.qsize() if hasattr(queue_manager, "_review_queue") else 0,
+            "workers": getattr(queue_manager, "workers", None),
+            "per_model_workers": getattr(queue_manager, "per_model_workers", None),
+        })
 
     @app.get("/readyz")
     def ready() -> Response:
@@ -330,6 +421,17 @@ def _run_dir(store: RunStore, run_id: str) -> Path:
 
 def _safe_id(value: str) -> bool:
     return bool(value) and all(char.isalnum() or char in "-_" for char in value)
+
+
+def _download_name(model_id: str) -> str:
+    return "".join(char if char.isalnum() or char in "-_" else "-" for char in model_id).strip("-") or "model"
+
+
+def _require_tested_model(store: RunStore, suite: Any, model_id: str) -> dict[str, Any]:
+    card = next((item for item in build_model_cards(store, suite) if item["id"] == model_id), None)
+    if card is None:
+        abort(404)
+    return card
 
 
 def _read_reviews(path: Path) -> list[dict[str, Any]]:

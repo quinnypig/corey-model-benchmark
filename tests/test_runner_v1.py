@@ -7,8 +7,8 @@ from corey_bench.runner import RunConfig, RunStore, suite_request_count
 
 
 class RunnerV1Tests(unittest.TestCase):
-    def test_full_suite_request_upper_bound_includes_agentic_turns(self):
-        self.assertEqual(suite_request_count(load_protocol()), 528)
+    def test_full_suite_request_upper_bound_includes_agentic_and_reviews(self):
+        self.assertEqual(suite_request_count(load_protocol()), 573)
 
     def test_job_expansion_and_manifest_receipts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -21,8 +21,9 @@ class RunnerV1Tests(unittest.TestCase):
             self.assertEqual(len(jobs), 8)
             manifest = store.manifest(run_id)
             self.assertEqual(manifest["expected_jobs"], 8)
-            self.assertEqual(manifest["estimated_requests"], 16)
+            self.assertEqual(manifest["estimated_requests"], 20)
             self.assertTrue(all(item["prompt_sha256"] for item in manifest["evals"]))
+            self.assertEqual([job.model for job in jobs[:4]], ["example/a", "example/b", "example/a", "example/b"])
 
 
 if __name__ == "__main__":

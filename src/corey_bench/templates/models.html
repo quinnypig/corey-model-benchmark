@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Model cards · Quinnferno{% endblock %}
+{% block hero %}<section class="hero"><div class="shell hero-inner"><div><div class="eyebrow">The evidence locker</div><h1>Model cards, with receipts.</h1><p>Every model Quinnferno has tested, contrasted on resolved score, coverage, latency, failure rate, and actual billed cost.</p></div><div class="hero-stat"><b>{{ cards|length }}</b><span>tested models</span></div></div></section>{% endblock %}
+{% block content %}
+{% if cards %}
+<section class="summary-strip">
+  <div class="metric"><span class="eyebrow">Models</span><b>{{ cards|length }}</b></div>
+  <div class="metric"><span class="eyebrow">Runs</span><b>{{ run_count }}</b></div>
+  <div class="metric"><span class="eyebrow">Attempts</span><b>{{ '{:,}'.format(attempt_count) }}</b></div>
+  <div class="metric"><span class="eyebrow">Billed</span><b>${{ '%.2f'|format(total_cost) }}</b></div>
+</section>
+<section class="card">
+  <div class="card-heading"><div><div class="eyebrow">Comparable evidence</div><h2>Tested model roster</h2></div><p class="muted">Best-coverage run per model · click through for every receipt</p></div>
+  <div class="picker-tools"><input id="card-filter" placeholder="Filter tested models…" autocomplete="off"><select id="card-sort"><option value="score">Highest resolved score</option><option value="coverage">Most coverage</option><option value="newest">Most recently tested</option><option value="cost">Lowest suite cost</option><option value="name">Name A–Z</option></select></div>
+  <div class="compare-wrap"><table class="compare" id="model-table"><thead><tr><th>Model</th><th>Resolved score</th><th>Coverage</th><th>Suite cost</th><th>Median response</th><th>Attempts</th><th>Failures</th><th>Most recent</th></tr></thead><tbody>
+  {% for card in cards %}{% set report=card.representative_run %}{% set latest=card.latest_run %}<tr data-name="{{ (card.name ~ ' ' ~ card.id)|lower }}" data-score="{{ report.score_percent if report.score_percent is not none else -1 }}" data-coverage="{{ report.resolved_weight }}" data-newest="{{ latest.created_at or '' }}" data-cost="{{ report.total_cost }}">
+    <td><a class="model-name" href="{{ url_for('model_detail',model_id=card.id) }}">{{ card.name }}</a><span class="model-id">{{ card.id }}</span></td>
+    <td>{% if report.score_percent is not none %}<span class="score">{{ '%.1f'|format(report.score_percent) }}<small>{{ '%.1f'|format(report.weighted_points) }} / {{ '%.0f'|format(report.resolved_weight) }} points</small></span><div class="mini-bar"><i style="width:{{ report.score_percent }}%"></i></div>{% else %}<span class="pill">pending</span>{% endif %}</td>
+    <td>{{ '%.0f'|format(report.resolved_weight) }}/100</td><td>${{ '%.4f'|format(report.total_cost) }}</td>
+    <td>{% if report.median_latency is not none %}{{ '%.1f'|format(report.median_latency) }}s{% else %}—{% endif %}</td>
+    <td>{{ report.completed_attempts }}</td><td>{% if report.failed_attempts %}<span class="pill bad">{{ report.failed_attempts }}</span>{% else %}<span class="pill good">0</span>{% endif %}</td>
+    <td><a class="run-link" href="{{ url_for('run_detail',run_id=latest.run_id) }}">{{ latest.run_id[:8] }}</a><br><span class="status {{ latest.status }}">{{ latest.status }}</span></td>
+  </tr>{% endfor %}
+  </tbody></table></div>
+</section>
+<script>
+const body=document.querySelector('#model-table tbody'),rows=[...body.rows],filter=document.querySelector('#card-filter'),sort=document.querySelector('#card-sort');
+function redraw(){const mode=sort.value,q=filter.value.trim().toLowerCase();rows.sort((a,b)=>{if(mode==='name')return a.dataset.name.localeCompare(b.dataset.name);if(mode==='newest')return b.dataset.newest.localeCompare(a.dataset.newest);if(mode==='cost')return Number(a.dataset.cost)-Number(b.dataset.cost);if(mode==='coverage')return Number(b.dataset.coverage)-Number(a.dataset.coverage)||Number(b.dataset.score)-Number(a.dataset.score);return Number(b.dataset.score)-Number(a.dataset.score)||Number(b.dataset.coverage)-Number(a.dataset.coverage)});rows.forEach(row=>{row.hidden=!row.dataset.name.includes(q);body.appendChild(row)})}filter.addEventListener('input',redraw);sort.addEventListener('change',redraw);
+</script>
+{% else %}<section class="card empty-state"><div class="eyebrow">No receipts yet</div><h2>The model-card wall is empty.</h2><p class="muted">Queue a run and cards will appear as soon as the first attempts land.</p><a class="button" href="/">Choose models</a></section>{% endif %}
+{% endblock %}
