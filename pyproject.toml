@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "corey-bench"
+version = "0.1.0"
+description = "A personal, outcome-oriented benchmark for language models"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+corey-bench = "corey_bench.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/corey_bench"]
