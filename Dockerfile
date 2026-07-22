@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     QUINNFERNO_WORKERS=3
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends imagemagick ca-certificates \
+    && apt-get install -y --no-install-recommends imagemagick librsvg2-bin ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1001 quinnferno \
     && useradd --uid 1001 --gid 1001 --create-home quinnferno
