@@ -19,21 +19,37 @@ SVG_TAGS = {
     "text", "tspan", "defs", "linearGradient", "radialGradient", "stop", "clipPath", "mask",
 }
 SVG_ATTRS = {
-    "xmlns", "width", "height", "viewBox", "x", "y", "x1", "x2", "y1", "y2", "cx", "cy",
+    "xmlns", "version", "width", "height", "viewBox", "x", "y", "x1", "x2", "y1", "y2", "cx", "cy",
     "r", "rx", "ry", "d", "points", "fill", "fill-opacity", "stroke", "stroke-width",
     "stroke-linecap", "stroke-linejoin", "stroke-dasharray", "opacity", "transform", "font-family",
     "font-size", "font-weight", "text-anchor", "dominant-baseline", "offset", "stop-color",
-    "stop-opacity", "clip-path", "mask", "id", "class", "aria-label", "role",
+    "stop-opacity", "clip-path", "mask", "id", "class", "style", "aria-label", "role",
+}
+SVG_STYLE_PROPERTIES = {
+    "fill", "fill-opacity", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin",
+    "stroke-dasharray", "opacity", "font-family", "font-size", "font-weight", "text-anchor",
+    "stop-color", "stop-opacity",
 }
 
 
 def extract_code(response: str, language: str) -> str:
-    fenced = re.search(rf"```(?:{re.escape(language)})?\s*(.*?)```", response, re.I | re.S)
-    return (fenced.group(1) if fenced else response).strip()
+    aliases = {language.casefold()}
+    if language.casefold() == "svg":
+        aliases.add("xml")
+    fences = re.findall(r"```([^\s`]*)\s*(.*?)```", response, re.I | re.S)
+    for label, content in fences:
+        if not label or label.casefold() in aliases:
+            return content.strip()
+    return response.strip()
 
 
 def validate_svg(response: str) -> tuple[str, dict[str, Any]]:
     svg = extract_code(response, "svg")
+    # Models commonly label SVG fences as XML or wrap otherwise valid SVG in a
+    # sentence. Isolate the document before applying the strict XML safety pass.
+    document = re.search(r"<svg\b.*?</svg\s*>", svg, re.I | re.S)
+    if document:
+        svg = document.group(0)
     encoded = svg.encode("utf-8")
     if len(encoded) > 750_000:
         raise ArtifactError("SVG exceeds the 750 KB safety limit")
@@ -62,6 +78,11 @@ def validate_svg(response: str) -> tuple[str, dict[str, Any]]:
             folded_value = value.casefold()
             if folded_name.startswith("on") or name not in SVG_ATTRS:
                 raise ArtifactError(f"Forbidden SVG attribute {name!r}")
+            if name == "style":
+                declarations = [part.strip() for part in value.split(";") if part.strip()]
+                properties = {part.split(":", 1)[0].strip() for part in declarations if ":" in part}
+                if len(properties) != len(declarations) or not properties <= SVG_STYLE_PROPERTIES:
+                    raise ArtifactError("SVG style contains a forbidden property")
             if "url(" in folded_value and not re.fullmatch(r"url\(#[A-Za-z_][\w:.-]*\)", value.strip()):
                 raise ArtifactError("External CSS URL is forbidden")
             if any(token in folded_value for token in ("javascript:", "data:", "http:", "https:", "file:")):

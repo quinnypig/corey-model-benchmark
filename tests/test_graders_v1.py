@@ -19,6 +19,26 @@ class GraderV1Tests(unittest.TestCase):
         with self.assertRaises(ArtifactError):
             validate_svg('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
 
+    def test_svg_validator_accepts_xml_fence(self):
+        safe, _ = validate_svg(f"```xml\n{SAFE_SVG}\n```")
+        self.assertIn("svg", safe)
+
+    def test_svg_validator_extracts_document_from_explanation(self):
+        safe, _ = validate_svg(f"Here is the requested image:\n{SAFE_SVG}\nEnjoy.")
+        self.assertIn("svg", safe)
+
+    def test_svg_validator_accepts_safe_inline_gradient_style(self):
+        safe, _ = validate_svg(
+            '<svg xmlns="http://www.w3.org/2000/svg" version="1.1"><defs><linearGradient id="g">'
+            '<stop offset="0%" style="stop-color:#ADD8E6; stop-opacity:1"/>'
+            '</linearGradient></defs></svg>'
+        )
+        self.assertIn("stop-color", safe)
+
+    def test_svg_validator_rejects_active_inline_style(self):
+        with self.assertRaises(ArtifactError):
+            validate_svg('<svg xmlns="http://www.w3.org/2000/svg"><rect style="background:url(https://bad.example/x)"/></svg>')
+
     def test_iam_requires_all_verdicts_and_reasons(self):
         answer = "\n".join(
             [

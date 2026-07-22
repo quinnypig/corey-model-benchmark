@@ -116,7 +116,7 @@ class RunStore:
                         key = f"{run_id}\0{model}\0{eval_id}\0{condition}\0{repetition}"
                         attempt_id = hashlib.sha256(key.encode()).hexdigest()[:20]
                         jobs.append(Job(run_id, model, eval_id, condition, repetition, attempt_id))
-                        request_estimate += request_count(definition, rendered[eval_id])
+                        request_estimate += condition_request_count(definition, rendered[eval_id], condition)
         manifest = {
             "protocol_version": "1.0",
             "run_id": run_id,
@@ -204,6 +204,33 @@ def request_count(definition: EvalDefinition, rendered: RenderedEval) -> int:
     if definition.execution == "multi_turn":
         return 1 + len(rendered.followups)
     return 1
+
+
+def condition_request_count(definition: EvalDefinition, rendered: RenderedEval, condition: str) -> int:
+    """Return the maximum provider calls made by one repetition of a condition."""
+    if condition == "agentic":
+        return 10
+    return request_count(definition, rendered)
+
+
+def suite_request_count(
+    suite: EvalSuite,
+    *,
+    conditions: tuple[str, ...] = ("weights-only", "search-enabled", "agentic"),
+    seed: int = 8675309,
+    repetitions: int | None = None,
+) -> int:
+    """Return the full-protocol maximum request count for one model."""
+    total = 0
+    for definition in suite.evals:
+        rendered = definition.render(seed)
+        for condition in conditions:
+            allowed = condition in definition.conditions or (
+                condition == "agentic" and definition.id in {"2.1", "2.2"}
+            )
+            if allowed:
+                total += condition_request_count(definition, rendered, condition) * (repetitions or definition.repetitions)
+    return total
 
 
 class RunQueue:
@@ -501,18 +528,20 @@ def estimate_cost(config: RunConfig, suite: EvalSuite, catalog: dict[str, dict[s
             definition = suite.get(eval_id)
             rendered = definition.render(config.seed)
             repetitions = config.repetitions or definition.repetitions
-            condition_count = sum(
-                condition in definition.conditions or (condition == "agentic" and eval_id in {"2.1", "2.2"})
-                for condition in config.conditions
-            )
-            calls = request_count(definition, rendered) * repetitions * condition_count
             if definition.execution == "repeated":
                 estimated_output = 3
             else:
                 estimated_output = min(definition.max_tokens, 1800) * 0.55
             prompt_chars = len(definition.prompt) + sum(map(len, rendered.prompts)) + sum(map(len, rendered.followups))
             estimated_input = max(30, prompt_chars / 4 / max(1, request_count(definition, rendered)))
-            total += calls * (request_rate + estimated_input * prompt_rate + estimated_output * completion_rate)
-            if "search-enabled" in config.conditions and "search-enabled" in definition.conditions:
-                total += calls * 0.005
+            for condition in config.conditions:
+                allowed = condition in definition.conditions or (
+                    condition == "agentic" and eval_id in {"2.1", "2.2"}
+                )
+                if not allowed:
+                    continue
+                calls = condition_request_count(definition, rendered, condition) * repetitions
+                total += calls * (request_rate + estimated_input * prompt_rate + estimated_output * completion_rate)
+                if condition == "search-enabled":
+                    total += calls * 0.005
     return round(total, 4)

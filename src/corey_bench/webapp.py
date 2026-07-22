@@ -5,6 +5,7 @@ import hashlib
 import os
 import secrets
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,10 @@ from .cli import _load_dotenv
 from .openrouter import OpenRouterError
 from .protocol import load_protocol
 from .reporting_v1 import build_report_data, write_v1_reports
-from .runner import RunConfig, RunQueue, RunStore, append_jsonl, build_queue_from_env
+from .runner import RunConfig, RunQueue, RunStore, append_jsonl, build_queue_from_env, suite_request_count
+
+
+FULL_CONDITIONS = ["weights-only", "search-enabled", "agentic"]
 
 
 class ModelCatalog:
@@ -28,7 +32,17 @@ class ModelCatalog:
     def get(self, force: bool = False) -> list[dict[str, Any]]:
         if force or not self.models or time.monotonic() - self.loaded_at > self.ttl:
             try:
-                self.models = sorted(self.queue.client.list_models(), key=lambda item: (str(item.get("name", "")).casefold(), item["id"]))
+                models = self.queue.client.list_models()
+                for model in models:
+                    try:
+                        created = float(model.get("created") or 0)
+                        model["created_label"] = datetime.fromtimestamp(created, timezone.utc).strftime("%b %d, %Y") if created else ""
+                    except (TypeError, ValueError, OSError):
+                        model["created_label"] = ""
+                self.models = sorted(
+                    models,
+                    key=lambda item: (-_model_created(item), str(item.get("name", "")).casefold(), item["id"]),
+                )
                 self.error = None
                 self.loaded_at = time.monotonic()
             except OpenRouterError as exc:
@@ -43,7 +57,7 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
         SECRET_KEY=os.environ.get("QUINNFERNO_SECRET_KEY") or secrets.token_hex(32),
         MAX_CONTENT_LENGTH=1_000_000,
     )
-    root = Path(runs_root or os.environ.get("QUINNFERNO_RUNS", "runs"))
+    root = Path(runs_root or os.environ.get("QUINNFERNO_RUNS", "runs")).resolve()
     store = run_queue.store if run_queue else RunStore(root)
     queue_manager = run_queue or build_queue_from_env(store)
     queue_manager.start()
@@ -70,7 +84,8 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
         models = catalog.get()
         return render_template(
             "index.html", suite=suite, models=models, catalog_error=catalog.error,
-            recent=store.recent()[:20], default_cases={"1.2", "1.4", "3.2", "3.3", "5.7", "5.8", "6.4"},
+            recent=store.recent()[:20], requests_per_model=suite_request_count(suite),
+            requests_per_forced_repetition=suite_request_count(suite, repetitions=1),
         )
 
     @app.get("/api/models")
@@ -83,8 +98,8 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
         models = list(dict.fromkeys(value.strip() for value in request.form.getlist("models") if value.strip()))
         custom = [value.strip() for value in request.form.get("custom_models", "").splitlines() if value.strip()]
         models = list(dict.fromkeys(models + custom))
-        eval_ids = list(dict.fromkeys(request.form.getlist("evals")))
-        conditions = list(dict.fromkeys(request.form.getlist("conditions") or ["weights-only"]))
+        eval_ids = [definition.id for definition in suite.evals]
+        conditions = FULL_CONDITIONS
         repetitions_raw = request.form.get("repetitions", "").strip()
         temperature_raw = request.form.get("temperature", "1.0").strip()
         config = RunConfig(
@@ -239,6 +254,13 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
         return jsonify({"status": "ready", "protocol": suite.version})
 
     return app
+
+
+def _model_created(model: dict[str, Any]) -> float:
+    try:
+        return float(model.get("created") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _run_dir(store: RunStore, run_id: str) -> Path:

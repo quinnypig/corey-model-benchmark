@@ -1,9 +1,10 @@
 import tempfile
 import unittest
+import os
 from pathlib import Path
 
 from corey_bench.protocol import load_protocol
-from corey_bench.runner import RunStore
+from corey_bench.runner import RunConfig, RunStore
 from corey_bench.webapp import create_app
 
 
@@ -22,6 +23,10 @@ class FakeQueue:
     def start(self):
         pass
 
+    def submit(self, config):
+        self.submitted = config
+        return "full-suite-test"
+
 
 class WebAppTests(unittest.TestCase):
     def test_dashboard_health_and_traversal(self):
@@ -33,8 +38,52 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(page.status_code, 200)
             self.assertIn(b"Quinnferno", page.data)
             self.assertIn(b"example/model", page.data)
+            self.assertIn(b"Most recently added", page.data)
+            self.assertIn(b"All 29 evals", page.data)
+            self.assertNotIn(b'name="evals"', page.data)
             self.assertEqual(client.get("/healthz").status_code, 200)
             self.assertEqual(client.get("/runs/%2e%2e%2fetc").status_code, 404)
+
+    def test_submission_always_queues_the_complete_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            queue = FakeQueue(Path(directory))
+            app = create_app(run_queue=queue)
+            app.config["TESTING"] = True
+            client = app.test_client()
+            client.get("/")
+            with client.session_transaction() as browser_session:
+                csrf = browser_session["csrf"]
+            response = client.post("/runs", data={"csrf": csrf, "models": "example/model"})
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(len(queue.submitted.eval_ids), 29)
+            self.assertEqual(queue.submitted.conditions, ["weights-only", "search-enabled", "agentic"])
+
+    def test_relative_runs_root_supports_report_download(self):
+        previous = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                fake_queue = FakeQueue(Path("runs").resolve())
+                run_id, jobs = fake_queue.store.create(
+                    RunConfig(models=["example/model"], eval_ids=["3.2"], conditions=["weights-only"], repetitions=1),
+                    fake_queue.suite,
+                )
+                fake_queue.store.append_result(
+                    run_id,
+                    {
+                        "attempt_id": jobs[0].attempt_id, "status": "ok", "model": "example/model",
+                        "eval_id": "3.2", "condition": "weights-only", "cost_usd": 0,
+                        "latency_seconds": 1, "usage": {},
+                        "grade": {"score": 1, "pass": True, "human_required": False, "verdict": "pass"},
+                    },
+                )
+                app = create_app(run_queue=fake_queue)
+                app.config["TESTING"] = True
+                response = app.test_client().get(f"/runs/{run_id}/report.json")
+                self.assertEqual(response.status_code, 200)
+                self.assertIn(b'"models"', response.data)
+            finally:
+                os.chdir(previous)
 
 
 if __name__ == "__main__":

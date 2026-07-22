@@ -3,10 +3,13 @@ import unittest
 from pathlib import Path
 
 from corey_bench.protocol import load_protocol
-from corey_bench.runner import RunConfig, RunStore
+from corey_bench.runner import RunConfig, RunStore, suite_request_count
 
 
 class RunnerV1Tests(unittest.TestCase):
+    def test_full_suite_request_upper_bound_includes_agentic_turns(self):
+        self.assertEqual(suite_request_count(load_protocol()), 528)
+
     def test_job_expansion_and_manifest_receipts(self):
         with tempfile.TemporaryDirectory() as directory:
             store = RunStore(directory)
