@@ -374,6 +374,7 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
         return jsonify({
             "status": "ok", "queue_depth": queue_manager._queue.qsize(),
             "review_queue_depth": queue_manager._review_queue.qsize() if hasattr(queue_manager, "_review_queue") else 0,
+            "review_jobs_active": len(queue_manager._review_inflight) if hasattr(queue_manager, "_review_inflight") else 0,
             "workers": getattr(queue_manager, "workers", None),
             "per_model_workers": getattr(queue_manager, "per_model_workers", None),
             "runtime": runtime_attributes(),

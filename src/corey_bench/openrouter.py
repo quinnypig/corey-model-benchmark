@@ -124,6 +124,7 @@ class OpenRouterClient:
         seed: int | None,
         reasoning: str,
         condition: str = "weights-only",
+        response_format: dict[str, Any] | None = None,
     ) -> Completion:
         payload: dict[str, Any] = {
             "model": model,
@@ -149,6 +150,8 @@ class OpenRouterClient:
                     "max_total_results": 10,
                 }
             ]
+        if response_format:
+            payload["response_format"] = response_format
         return self._send_completion(payload)
 
     def _send_completion(self, payload: dict[str, Any]) -> Completion:

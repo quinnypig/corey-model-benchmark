@@ -42,10 +42,16 @@ class OpenRouterV1Tests(unittest.TestCase):
     def test_search_condition_uses_openrouter_server_tool(self, mocked_open):
         OpenRouterClient("key").complete_messages(
             model="example/model", messages=[{"role": "user", "content": "hi"}],
-            max_tokens=20, temperature=1, seed=2, reasoning="off", condition="search-enabled",
+            max_tokens=20,
+            temperature=1,
+            seed=2,
+            reasoning="off",
+            condition="search-enabled",
+            response_format={"type": "json_object"},
         )
         payload = json.loads(mocked_open.call_args.args[0].data)
         self.assertEqual(payload["tools"][0]["type"], "openrouter:web_search")
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
 
     @patch("time.sleep")
     @patch("urllib.request.urlopen")

@@ -14,7 +14,7 @@ from typing import Any
 
 from .artifacts import ArtifactError, extract_code, validate_svg, write_svg_preview
 from .graders import grade_attempt
-from .judging import judge_messages, parse_judge_output
+from .judging import JudgeOutputError, judge_messages, parse_judge_output
 from .openrouter import OpenRouterClient, OpenRouterError
 from .protocol import EvalDefinition, EvalSuite, RenderedEval, load_protocol
 from .telemetry import runtime_attributes, set_attributes, span, trim_memory
@@ -321,6 +321,7 @@ class RunQueue:
         max_auto_recoveries: int = 3,
         recovery_window_seconds: int = 3600,
         report_interval_seconds: int = 30,
+        max_review_attempts: int = 2,
     ) -> None:
         self.store = store or RunStore()
         self.suite = suite or load_protocol()
@@ -332,6 +333,7 @@ class RunQueue:
         self.max_auto_recoveries = max(1, int(max_auto_recoveries))
         self.recovery_window_seconds = max(60, int(recovery_window_seconds))
         self.report_interval_seconds = max(0, int(report_interval_seconds))
+        self.max_review_attempts = max(1, int(max_review_attempts))
         self._queue: queue.Queue[Job | None] = queue.Queue()
         self._review_queue: queue.Queue[ReviewJob | None] = queue.Queue()
         self._threads: list[threading.Thread] = []
@@ -340,6 +342,8 @@ class RunQueue:
         self._model_limits_guard = threading.Lock()
         self._report_guard = threading.Lock()
         self._report_last: dict[str, float] = {}
+        self._review_guard = threading.Lock()
+        self._review_inflight: set[tuple[str, str]] = set()
         self._started = False
 
     def start(self) -> None:
@@ -352,6 +356,7 @@ class RunQueue:
                 "queue.per_model_worker_count": self.per_model_workers,
                 "queue.judge_worker_count": self.judge_workers,
                 "queue.judge_model": self.judge_model,
+                "queue.max_review_attempts": self.max_review_attempts,
                 **runtime_attributes(),
             },
         ) as current:
@@ -479,9 +484,19 @@ class RunQueue:
             for review in read_jsonl(self.store.run_dir(run_id) / "reviews.jsonl"):
                 if review.get("reviewer_type") == "model":
                     reviewed.add((run_id, str(review.get("attempt_id"))))
+            attempts = self._review_attempt_counts(run_id)
             for attempt_id in self.store.reviewable_attempt_ids(run_id):
                 key = (run_id, attempt_id)
-                if key not in reviewed:
+                if key in reviewed:
+                    continue
+                if attempts.get(attempt_id, 0) >= self.max_review_attempts:
+                    append_jsonl(
+                        self.store.run_dir(run_id) / "reviews.jsonl",
+                        self._review_fuse_receipt(attempt_id, attempts[attempt_id]),
+                        self.store.lock(run_id),
+                    )
+                    reviewed.add(key)
+                else:
                     self._review_queue.put(ReviewJob(*key))
                     queued += 1
         return queued
@@ -593,6 +608,12 @@ class RunQueue:
             job = self._review_queue.get()
             if job is None:
                 return
+            key = (job.run_id, job.attempt_id)
+            with self._review_guard:
+                if key in self._review_inflight:
+                    self._review_queue.task_done()
+                    continue
+                self._review_inflight.add(key)
             try:
                 with span(
                     "eval.review",
@@ -623,6 +644,8 @@ class RunQueue:
                     self.store.lock(job.run_id),
                 )
             finally:
+                with self._review_guard:
+                    self._review_inflight.discard(key)
                 self._review_queue.task_done()
 
     def _execute_review(self, job: ReviewJob) -> dict[str, Any] | None:
@@ -635,6 +658,11 @@ class RunQueue:
         result = self.store.result(job.run_id, job.attempt_id)
         if not result or not _can_model_review(result):
             return None
+        attempts = self._review_attempt_counts(job.run_id).get(job.attempt_id, 0)
+        if attempts >= self.max_review_attempts:
+            receipt = self._review_fuse_receipt(job.attempt_id, attempts)
+            append_jsonl(reviews_path, receipt, self.store.lock(job.run_id))
+            return receipt
         manifest = self.store.manifest(job.run_id)
         budget = manifest.get("config", {}).get("max_budget_usd")
         _, inference_spend = self.store.result_summary(job.run_id)
@@ -651,6 +679,16 @@ class RunQueue:
             )
             return receipt
         eval_manifest = next(row for row in manifest.get("evals", []) if row.get("id") == result.get("eval_id"))
+        append_jsonl(
+            self.store.run_dir(job.run_id) / "judge-attempts.jsonl",
+            {
+                "attempt_id": job.attempt_id,
+                "judge_model": self.judge_model,
+                "attempt_number": attempts + 1,
+                "started_at": utc_now(),
+            },
+            self.store.lock(job.run_id),
+        )
         with self._model_limit(self.judge_model):
             completion = self.client.complete_messages(
                 model=self.judge_model,
@@ -658,9 +696,28 @@ class RunQueue:
                 max_tokens=1400,
                 temperature=0,
                 seed=8675309,
-                reasoning="high",
+                reasoning="low",
+                response_format={"type": "json_object"},
             )
-        judged = parse_judge_output(completion.text)
+        judge_output = completion.text or completion.reasoning or ""
+        try:
+            judged = parse_judge_output(judge_output)
+        except JudgeOutputError as exc:
+            receipt = {
+                "attempt_id": job.attempt_id,
+                "reviewed_at": utc_now(),
+                "reviewer_type": "model",
+                "judge_model": self.judge_model,
+                "status": "invalid_judge_output",
+                "error": str(exc),
+                "judge_response": completion.text[:20_000],
+                "judge_reasoning": (completion.reasoning or "")[:20_000],
+                "usage": completion.usage,
+                "cost_usd": float(completion.usage.get("cost") or 0),
+                "response_id": completion.response_id,
+            }
+            append_jsonl(reviews_path, receipt, self.store.lock(job.run_id))
+            return receipt
         receipt = {
             "attempt_id": job.attempt_id,
             "reviewed_at": utc_now(),
@@ -681,6 +738,36 @@ class RunQueue:
         )
         self._refresh_report(job.run_id)
         return receipt
+
+    def _review_attempt_counts(self, run_id: str) -> dict[str, int]:
+        intent_counts: dict[str, int] = {}
+        error_counts: dict[str, int] = {}
+        with self.store.lock(run_id):
+            attempts = read_jsonl(self.store.run_dir(run_id) / "judge-attempts.jsonl")
+            errors = read_jsonl(self.store.run_dir(run_id) / "judge-errors.jsonl")
+        for row in attempts:
+            attempt_id = str(row.get("attempt_id") or "")
+            if attempt_id:
+                intent_counts[attempt_id] = intent_counts.get(attempt_id, 0) + 1
+        for row in errors:
+            attempt_id = str(row.get("attempt_id") or "")
+            if attempt_id:
+                error_counts[attempt_id] = error_counts.get(attempt_id, 0) + 1
+        return {
+            attempt_id: max(intent_counts.get(attempt_id, 0), error_counts.get(attempt_id, 0))
+            for attempt_id in intent_counts.keys() | error_counts.keys()
+        }
+
+    def _review_fuse_receipt(self, attempt_id: str, attempts: int) -> dict[str, Any]:
+        return {
+            "attempt_id": attempt_id,
+            "reviewed_at": utc_now(),
+            "reviewer_type": "model",
+            "judge_model": self.judge_model,
+            "status": "skipped_recovery_fuse",
+            "review_attempts": attempts,
+            "cost_usd": 0,
+        }
 
     def _finish_skipped(self, job: Job) -> None:
         result = self._error_result(job, RuntimeError("Run cancelled"), status="cancelled")
@@ -890,6 +977,7 @@ def build_queue_from_env(store: RunStore | None = None) -> RunQueue:
     max_auto_recoveries = int(os.environ.get("QUINNFERNO_MAX_AUTO_RECOVERIES", "3"))
     recovery_window_seconds = int(os.environ.get("QUINNFERNO_RECOVERY_WINDOW_SECONDS", "3600"))
     report_interval_seconds = int(os.environ.get("QUINNFERNO_REPORT_INTERVAL_SECONDS", "30"))
+    max_review_attempts = int(os.environ.get("QUINNFERNO_MAX_REVIEW_ATTEMPTS", "2"))
     return RunQueue(
         key,
         store=store,
@@ -900,6 +988,7 @@ def build_queue_from_env(store: RunStore | None = None) -> RunQueue:
         max_auto_recoveries=max_auto_recoveries,
         recovery_window_seconds=recovery_window_seconds,
         report_interval_seconds=report_interval_seconds,
+        max_review_attempts=max_review_attempts,
     )
 
 

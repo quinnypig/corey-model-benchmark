@@ -103,6 +103,9 @@ history and pauses a run after three automatic recoveries in one hour by
 default, bounding repeated paid calls during a crashloop. The run page explains
 the fuse and offers an explicit resume action. Tune this with
 `QUINNFERNO_MAX_AUTO_RECOVERIES` and `QUINNFERNO_RECOVERY_WINDOW_SECONDS`.
+Model-judge calls write a durable intent before contacting OpenRouter and stop
+after two attempts per response (`QUINNFERNO_MAX_REVIEW_ATTEMPTS`), including
+calls whose process died before it could save the final review receipt.
 Reports are rebuilt at most every 30 seconds while a run is active and forced
 at completion, avoiding the allocator pressure caused by materializing a
 growing receipt ledger after every result.
