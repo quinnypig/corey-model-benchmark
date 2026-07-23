@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .artifacts import ArtifactError, extract_code, validate_svg, write_svg_preview
+from .artifacts import ArtifactError, extract_code, salvage_svg_preview, validate_svg, write_svg_preview
 from .graders import grade_attempt
 from .judging import JudgeOutputError, judge_messages, parse_judge_output
 from .openrouter import OpenRouterClient, OpenRouterError
@@ -306,6 +306,8 @@ def suite_request_count(
 
 
 class RunQueue:
+    SVG_ARTIFACT_VERSION = 3
+
     def __init__(
         self,
         api_key: str,
@@ -361,6 +363,7 @@ class RunQueue:
             },
         ) as current:
             self._started = True
+            rebuilt_artifacts = self._rebuild_svg_artifacts()
             for number in range(self.workers):
                 thread = threading.Thread(target=self._worker, name=f"quinnferno-worker-{number+1}", daemon=True)
                 thread.start()
@@ -375,12 +378,83 @@ class RunQueue:
                 current,
                 {
                     **recovery,
+                    **rebuilt_artifacts,
                     "recovery.review_count": recovered_reviews,
                     "queue.depth": self._queue.qsize(),
                     "queue.review_depth": self._review_queue.qsize(),
                     **runtime_attributes(),
                 },
             )
+
+    def _rebuild_svg_artifacts(self) -> dict[str, int]:
+        """Upgrade stored SVG previews without changing historical grades."""
+        rebuilt_runs = 0
+        rebuilt_artifacts = 0
+        salvaged_artifacts = 0
+        errors = 0
+        marker_name = f".svg-artifacts-v{self.SVG_ARTIFACT_VERSION}.json"
+        for state in self.store.recent():
+            run_id = state["run_id"]
+            run_dir = self.store.run_dir(run_id)
+            results_path = run_dir / "results.jsonl"
+            marker_path = run_dir / marker_name
+            if marker_path.exists() or not results_path.exists():
+                continue
+            temporary = results_path.with_suffix(".svg-rebuild.tmp")
+            changed = False
+            try:
+                with self.store.lock(run_id):
+                    with results_path.open(encoding="utf-8") as source, temporary.open("w", encoding="utf-8") as target:
+                        for number, line in enumerate(source, 1):
+                            if not line.strip():
+                                continue
+                            row = json.loads(line)
+                            eval_id = str(row.get("eval_id") or "")
+                            definition = next((item for item in self.suite.evals if item.id == eval_id), None)
+                            if row.get("status") == "ok" and definition and definition.renderer == "svg":
+                                outputs = row.get("responses") or [row.get("response") or ""]
+                                job = Job(
+                                    run_id=run_id,
+                                    model=str(row.get("model") or "unknown"),
+                                    eval_id=eval_id,
+                                    condition=str(row.get("condition") or "weights-only"),
+                                    repetition=int(row.get("repetition") or 1),
+                                    attempt_id=str(row["attempt_id"]),
+                                )
+                                try:
+                                    row["artifacts"] = self._artifacts(
+                                        job, definition, [str(value) for value in outputs], row.get("grade") or {},
+                                    )
+                                    rebuilt_artifacts += 1
+                                    salvaged_artifacts += int(
+                                        bool(row["artifacts"] and row["artifacts"][0].get("salvaged"))
+                                    )
+                                    changed = True
+                                except Exception:
+                                    errors += 1
+                            target.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        target.flush()
+                        os.fsync(target.fileno())
+                    temporary.replace(results_path)
+                    atomic_json(
+                        marker_path,
+                        {
+                            "version": self.SVG_ARTIFACT_VERSION,
+                            "rebuilt_at": utc_now(),
+                            "changed": changed,
+                        },
+                    )
+                rebuilt_runs += 1
+            except (OSError, ValueError, json.JSONDecodeError):
+                errors += 1
+                if temporary.exists():
+                    temporary.unlink()
+        return {
+            "artifact.rebuilt_run_count": rebuilt_runs,
+            "artifact.rebuilt_count": rebuilt_artifacts,
+            "artifact.salvaged_count": salvaged_artifacts,
+            "artifact.rebuild_error_count": errors,
+        }
 
     def submit(self, config: RunConfig) -> str:
         if len(config.models) > 10:
@@ -884,9 +958,25 @@ class RunQueue:
                 artifact = write_svg_preview(safe_svg, directory, job.attempt_id)
                 artifact["artifact_id"] = job.attempt_id
                 artifact["valid"] = True
+                if not artifact.get("preview"):
+                    artifact["error"] = artifact.get("render_error") or "SVG renderer did not produce a preview"
                 return [artifact]
             except ArtifactError as exc:
-                return [{"artifact_id": job.attempt_id, "kind": "svg", "valid": False, "error": str(exc)}]
+                try:
+                    safe_svg, repair = salvage_svg_preview(outputs[-1])
+                    artifact = write_svg_preview(safe_svg, directory, job.attempt_id)
+                    artifact.update(
+                        {
+                            "artifact_id": job.attempt_id,
+                            "valid": False,
+                            "salvaged": True,
+                            "discarded_bytes": repair["discarded_bytes"],
+                            "error": str(exc),
+                        }
+                    )
+                    return [artifact]
+                except ArtifactError:
+                    return [{"artifact_id": job.attempt_id, "kind": "svg", "valid": False, "error": str(exc)}]
         if definition.renderer == "html":
             path = directory / f"{job.attempt_id}.html.txt"
             path.write_text(extract_code(outputs[-1], "html"), encoding="utf-8")

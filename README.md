@@ -85,7 +85,7 @@ The frozen weighting policy is encoded in `benchmarks/quinn_v1.json` and validat
 
 Model-generated SVG and HTML are hostile input. Raw output is served as an attachment or escaped text only.
 
-Platypus SVGs are size-limited, parsed as XML, and rejected if they contain document types, entities, scripts, event handlers, `foreignObject`, animation, external URLs, data URLs, unsupported elements, extreme dimensions, or excessive nodes. Only sanitized SVG is passed to a resource-limited ImageMagick process, and the gallery serves the resulting PNG. Generated status-page HTML is archived as inert text and never placed into the Quinnferno origin.
+Platypus SVGs are size-limited, parsed as XML, and rejected if they contain document types, entities, scripts, event handlers, `foreignObject`, animation, external URLs, data URLs, unsupported elements, extreme dimensions, or excessive nodes. Only sanitized SVG is passed to a time-limited standards renderer (with a resource-limited ImageMagick fallback), and the gallery serves the resulting PNG. If a model exhausts its output budget after starting valid SVG, Quinnferno can close the already-open safe elements to create a clearly labeled preview; that repair never changes the failed benchmark grade. Generated status-page HTML is archived as inert text and never placed into the Quinnferno origin.
 
 The current “agentic” coding treatment performs up to ten model repair loops from deterministic static gate feedback. It does not claim browser/visual verification; adding an isolated Chromium worker is a future protocol version, not a silent methodology change.
 

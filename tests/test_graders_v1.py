@@ -1,6 +1,6 @@
 import unittest
 
-from corey_bench.artifacts import ArtifactError, svg_bill_arithmetic, validate_svg
+from corey_bench.artifacts import ArtifactError, salvage_svg_preview, svg_bill_arithmetic, validate_svg
 from corey_bench.graders import grade_attempt
 from corey_bench.protocol import load_protocol
 
@@ -43,16 +43,46 @@ class GraderV1Tests(unittest.TestCase):
         safe, _ = validate_svg(
             '''```xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100%" height="100%">
-  <defs><filter id="glow"><feGaussianBlur stdDeviation="8" result="blur"/><feComposite in="SourceGraphic" in2="blur" operator="over"/></filter></defs>
+  <defs><filter id="glow"><feGaussianBlur stdDeviation="8" result="blur"/><feComposite in="SourceGraphic" in2="blur" operator="over"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
   <circle cx="50" cy="50" r="20" fill="#38bdf8" filter="url(#glow)"/>
 </svg>
 ```'''
         )
         self.assertIn("feGaussianBlur", safe)
+        self.assertIn("feMergeNode", safe)
 
     def test_unclosed_svg_reports_truncation(self):
         with self.assertRaisesRegex(ArtifactError, "Truncated SVG"):
             validate_svg('```xml\n<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"')
+
+    def test_svg_validator_accepts_safe_accessibility_and_presentation(self):
+        safe, _ = validate_svg(
+            '<svg xmlns="http://www.w3.org/2000/svg" aria-labelledby="title description" '
+            'style="background-color:#fff"><title id="title">A platypus</title>'
+            '<desc id="description">Crying over a bill</desc>'
+            '<text pointer-events="none" letter-spacing="2">AWS</text></svg>'
+        )
+        self.assertIn("aria-labelledby", safe)
+        self.assertIn("background-color", safe)
+
+    def test_truncated_safe_svg_can_be_salvaged_for_preview(self):
+        safe, info = salvage_svg_preview(
+            '```xml\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+            '<g><circle cx="50" cy="50" r="20"/><path d="M10 10 L'
+        )
+        self.assertTrue(info["salvaged"])
+        self.assertGreater(info["discarded_bytes"], 0)
+        self.assertIn("circle", safe)
+        self.assertNotIn("path", safe)
+        validate_svg(safe)
+
+    def test_svg_salvage_does_not_bypass_safety_validation(self):
+        with self.assertRaisesRegex(ArtifactError, "Forbidden SVG element"):
+            salvage_svg_preview(
+                '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><path d="M'
+            )
+        with self.assertRaises(ArtifactError):
+            salvage_svg_preview("")
 
     def test_iam_requires_all_verdicts_and_reasons(self):
         answer = "\n".join(

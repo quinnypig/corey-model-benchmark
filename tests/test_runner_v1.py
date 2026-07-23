@@ -1,6 +1,8 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from corey_bench.protocol import load_protocol
 from corey_bench.runner import RunConfig, RunQueue, RunStore, suite_request_count
@@ -64,6 +66,50 @@ class RunnerV1Tests(unittest.TestCase):
             self.assertEqual(store.state(run_id)["status"], "queued")
             self.assertEqual(store.state(run_id)["recovery_history"], [])
             self.assertEqual(queue._queue.qsize(), 1)
+
+    def test_svg_artifact_migration_salvages_preview_without_changing_grade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(directory)
+            run_id, jobs = store.create(
+                RunConfig(
+                    models=["example/model"],
+                    eval_ids=["1.2"],
+                    conditions=["weights-only"],
+                    repetitions=1,
+                ),
+                load_protocol(),
+            )
+            grade = {"score": 0.0, "pass": False, "verdict": "Truncated SVG"}
+            store.append_result(
+                run_id,
+                {
+                    "attempt_id": jobs[0].attempt_id,
+                    "run_id": run_id,
+                    "status": "ok",
+                    "model": jobs[0].model,
+                    "eval_id": "1.2",
+                    "condition": "weights-only",
+                    "repetition": 1,
+                    "response": '<svg xmlns="http://www.w3.org/2000/svg"><g><circle r="10"/><path d="M',
+                    "grade": grade,
+                    "artifacts": [{"kind": "svg", "valid": False, "error": "old validator error"}],
+                },
+            )
+            queue = RunQueue("test", store=store, judge_workers=0)
+            with patch(
+                "corey_bench.runner.write_svg_preview",
+                return_value={"kind": "svg", "path": "a.svg", "preview": "a.png", "render_error": None},
+            ):
+                stats = queue._rebuild_svg_artifacts()
+
+            row = json.loads((store.run_dir(run_id) / "results.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(stats["artifact.rebuilt_count"], 1)
+            self.assertEqual(stats["artifact.salvaged_count"], 1)
+            self.assertTrue(row["artifacts"][0]["salvaged"])
+            self.assertFalse(row["artifacts"][0]["valid"])
+            self.assertEqual(row["grade"], grade)
+            self.assertTrue((store.run_dir(run_id) / ".svg-artifacts-v3.json").exists())
+            self.assertEqual(queue._rebuild_svg_artifacts()["artifact.rebuilt_run_count"], 0)
 
 
 if __name__ == "__main__":
