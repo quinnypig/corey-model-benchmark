@@ -113,6 +113,27 @@ docker run --rm -p 8765:8765 \
   quinnferno
 ```
 
+For a startup smoke test, use a named container so a crash cannot discard its
+logs. This check uses the image's declared port, removes the container after a
+successful response, and retains it after a failure:
+
+```bash
+(
+  set -eu
+  container="quinnferno-smoke-$$"
+  docker run --name "$container" -d -p 127.0.0.1:8765:8765 \
+    -e OPENROUTER_API_KEY \
+    quinnferno
+  if ! curl --fail --silent --show-error --retry 10 --retry-connrefused \
+    --retry-all-errors --retry-delay 1 http://127.0.0.1:8765/ >/dev/null; then
+    docker logs "$container"
+    echo "Retained failed container: $container" >&2
+    exit 1
+  fi
+  docker rm -f "$container"
+)
+```
+
 ## Legacy CLI
 
 The original benchmark remains available:
