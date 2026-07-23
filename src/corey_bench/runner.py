@@ -17,6 +17,7 @@ from .graders import grade_attempt
 from .judging import judge_messages, parse_judge_output
 from .openrouter import OpenRouterClient, OpenRouterError
 from .protocol import EvalDefinition, EvalSuite, RenderedEval, load_protocol
+from .telemetry import runtime_attributes, set_attributes, span, trim_memory
 
 
 def utc_now() -> str:
@@ -180,6 +181,63 @@ class RunStore:
         with self.lock(run_id):
             return read_jsonl(self.run_dir(run_id) / "results.jsonl")
 
+    def result_summary(self, run_id: str) -> tuple[set[str], float]:
+        """Stream the large receipt ledger instead of materializing it in every worker."""
+        attempts: set[str] = set()
+        cost = 0.0
+        path = self.run_dir(run_id) / "results.jsonl"
+        with self.lock(run_id):
+            if not path.exists():
+                return attempts, cost
+            with path.open(encoding="utf-8") as handle:
+                for number, line in enumerate(handle, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(f"Invalid JSONL {path}:{number}: {exc}") from exc
+                    if row.get("attempt_id"):
+                        attempts.add(str(row["attempt_id"]))
+                    cost += float(row.get("cost_usd") or row.get("usage", {}).get("cost") or 0)
+        return attempts, cost
+
+    def result(self, run_id: str, attempt_id: str) -> dict[str, Any] | None:
+        path = self.run_dir(run_id) / "results.jsonl"
+        with self.lock(run_id):
+            if not path.exists():
+                return None
+            with path.open(encoding="utf-8") as handle:
+                for number, line in enumerate(handle, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(f"Invalid JSONL {path}:{number}: {exc}") from exc
+                    if row.get("attempt_id") == attempt_id:
+                        return row
+        return None
+
+    def reviewable_attempt_ids(self, run_id: str) -> list[str]:
+        """Stream review eligibility without retaining every large response receipt."""
+        attempt_ids: list[str] = []
+        path = self.run_dir(run_id) / "results.jsonl"
+        with self.lock(run_id):
+            if not path.exists():
+                return attempt_ids
+            with path.open(encoding="utf-8") as handle:
+                for number, line in enumerate(handle, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(f"Invalid JSONL {path}:{number}: {exc}") from exc
+                    if _can_model_review(row):
+                        attempt_ids.append(str(row["attempt_id"]))
+        return attempt_ids
+
     def recent(self) -> list[dict[str, Any]]:
         runs = []
         for path in sorted(self.root.glob("*/state.json"), reverse=True):
@@ -260,6 +318,9 @@ class RunQueue:
         judge_workers: int = 2,
         timeout: float = 300,
         attempts: int = 5,
+        max_auto_recoveries: int = 3,
+        recovery_window_seconds: int = 3600,
+        report_interval_seconds: int = 30,
     ) -> None:
         self.store = store or RunStore()
         self.suite = suite or load_protocol()
@@ -268,68 +329,183 @@ class RunQueue:
         self.per_model_workers = max(1, min(int(per_model_workers), self.workers))
         self.judge_model = judge_model
         self.judge_workers = max(0, min(int(judge_workers), 4))
+        self.max_auto_recoveries = max(1, int(max_auto_recoveries))
+        self.recovery_window_seconds = max(60, int(recovery_window_seconds))
+        self.report_interval_seconds = max(0, int(report_interval_seconds))
         self._queue: queue.Queue[Job | None] = queue.Queue()
         self._review_queue: queue.Queue[ReviewJob | None] = queue.Queue()
         self._threads: list[threading.Thread] = []
         self._judge_threads: list[threading.Thread] = []
         self._model_limits: dict[str, threading.BoundedSemaphore] = {}
         self._model_limits_guard = threading.Lock()
+        self._report_guard = threading.Lock()
+        self._report_last: dict[str, float] = {}
         self._started = False
 
     def start(self) -> None:
         if self._started:
             return
-        self._started = True
-        for number in range(self.workers):
-            thread = threading.Thread(target=self._worker, name=f"quinnferno-worker-{number+1}", daemon=True)
-            thread.start()
-            self._threads.append(thread)
-        self.recover()
-        for number in range(self.judge_workers):
-            thread = threading.Thread(target=self._judge_worker, name=f"quinnferno-judge-{number+1}", daemon=True)
-            thread.start()
-            self._judge_threads.append(thread)
-        self.recover_reviews()
+        with span(
+            "queue.startup",
+            {
+                "queue.worker_count": self.workers,
+                "queue.per_model_worker_count": self.per_model_workers,
+                "queue.judge_worker_count": self.judge_workers,
+                "queue.judge_model": self.judge_model,
+                **runtime_attributes(),
+            },
+        ) as current:
+            self._started = True
+            for number in range(self.workers):
+                thread = threading.Thread(target=self._worker, name=f"quinnferno-worker-{number+1}", daemon=True)
+                thread.start()
+                self._threads.append(thread)
+            recovery = self.recover()
+            for number in range(self.judge_workers):
+                thread = threading.Thread(target=self._judge_worker, name=f"quinnferno-judge-{number+1}", daemon=True)
+                thread.start()
+                self._judge_threads.append(thread)
+            recovered_reviews = self.recover_reviews()
+            set_attributes(
+                current,
+                {
+                    **recovery,
+                    "recovery.review_count": recovered_reviews,
+                    "queue.depth": self._queue.qsize(),
+                    "queue.review_depth": self._review_queue.qsize(),
+                    **runtime_attributes(),
+                },
+            )
 
     def submit(self, config: RunConfig) -> str:
         if len(config.models) > 10:
             raise ValueError("A run may contain at most 10 models")
         if not config.models or not config.eval_ids:
             raise ValueError("Select at least one model and one eval")
-        catalog = self.client.list_models()
-        available = {item["id"]: item for item in catalog}
-        missing = [model for model in config.models if model not in available]
-        if missing:
-            raise OpenRouterError("Requested model ID(s) are unavailable for this API key: " + ", ".join(missing))
-        config = replace(config, estimated_cost_usd=estimate_cost(config, self.suite, available, self.judge_model if self.judge_workers else None))
-        run_id, jobs = self.store.create(config, self.suite)
-        for job in jobs:
-            self._queue.put(job)
-        return run_id
+        with span(
+            "run.submit",
+            {
+                "run.model_count": len(config.models),
+                "run.eval_count": len(config.eval_ids),
+                "run.conditions": config.conditions,
+                "run.max_budget_usd": config.max_budget_usd,
+            },
+        ) as current:
+            catalog = self.client.list_models()
+            available = {item["id"]: item for item in catalog}
+            missing = [model for model in config.models if model not in available]
+            if missing:
+                raise OpenRouterError("Requested model ID(s) are unavailable for this API key: " + ", ".join(missing))
+            config = replace(config, estimated_cost_usd=estimate_cost(config, self.suite, available, self.judge_model if self.judge_workers else None))
+            run_id, jobs = self.store.create(config, self.suite)
+            for job in jobs:
+                self._queue.put(job)
+            set_attributes(
+                current,
+                {
+                    "run.id": run_id,
+                    "run.job_count": len(jobs),
+                    "run.estimated_cost_usd": config.estimated_cost_usd,
+                    "queue.depth": self._queue.qsize(),
+                },
+            )
+            return run_id
 
-    def recover(self) -> None:
+    def recover(self) -> dict[str, int]:
+        recovered_runs = 0
+        recovered_jobs = 0
+        paid_calls_at_risk = 0
+        paused_runs = 0
         for state in self.store.recent():
             if state.get("status") not in {"queued", "running", "interrupted"}:
                 continue
             run_id = state["run_id"]
-            completed = {row.get("attempt_id") for row in self.store.results(run_id)}
+            completed, _ = self.store.result_summary(run_id)
             manifest = self.store.manifest(run_id)
-            self.store.update_state(run_id, status="queued", active_jobs=0)
+            now = datetime.now(timezone.utc)
+            cutoff = now.timestamp() - self.recovery_window_seconds
+            history = []
+            for value in state.get("recovery_history", []):
+                try:
+                    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if parsed.timestamp() >= cutoff:
+                    history.append(parsed.isoformat())
+            previous_active = int(state.get("active_jobs") or 0)
+            paid_calls_at_risk += previous_active
+            if previous_active and len(history) >= self.max_auto_recoveries:
+                self.store.update_state(
+                    run_id,
+                    status="recovery_paused",
+                    active_jobs=0,
+                    active_attempts={},
+                    recovery_history=history,
+                    recovery_paused_at=utc_now(),
+                    recovery_reason=f"{len(history)} automatic recoveries inside {self.recovery_window_seconds} seconds",
+                )
+                paused_runs += 1
+                continue
+            if previous_active:
+                history.append(now.isoformat())
+            self.store.update_state(
+                run_id,
+                status="queued",
+                active_jobs=0,
+                active_attempts={},
+                recovery_history=history,
+                recovery_count=int(state.get("recovery_count") or 0) + 1,
+                last_recovered_at=utc_now(),
+            )
+            added = 0
             for raw in manifest.get("jobs", []):
                 if raw.get("attempt_id") not in completed:
                     self._queue.put(Job(**raw))
+                    added += 1
+            recovered_runs += 1
+            recovered_jobs += added
+        return {
+            "recovery.run_count": recovered_runs,
+            "recovery.job_count": recovered_jobs,
+            "recovery.paused_run_count": paused_runs,
+            "recovery.paid_calls_at_risk": paid_calls_at_risk,
+        }
 
-    def recover_reviews(self) -> None:
+    def recover_reviews(self) -> int:
         reviewed: set[tuple[str, str]] = set()
+        queued = 0
         for state in self.store.recent():
             run_id = state["run_id"]
             for review in read_jsonl(self.store.run_dir(run_id) / "reviews.jsonl"):
                 if review.get("reviewer_type") == "model":
                     reviewed.add((run_id, str(review.get("attempt_id"))))
-            for result in self.store.results(run_id):
-                key = (run_id, str(result.get("attempt_id")))
-                if _can_model_review(result) and key not in reviewed:
+            for attempt_id in self.store.reviewable_attempt_ids(run_id):
+                key = (run_id, attempt_id)
+                if key not in reviewed:
                     self._review_queue.put(ReviewJob(*key))
+                    queued += 1
+        return queued
+
+    def resume(self, run_id: str) -> int:
+        state = self.store.state(run_id)
+        if state.get("status") != "recovery_paused":
+            raise ValueError("Run is not paused by the recovery fuse")
+        completed, _ = self.store.result_summary(run_id)
+        manifest = self.store.manifest(run_id)
+        jobs = [Job(**raw) for raw in manifest.get("jobs", []) if raw.get("attempt_id") not in completed]
+        self.store.update_state(
+            run_id,
+            status="queued",
+            active_jobs=0,
+            active_attempts={},
+            recovery_history=[],
+            recovery_resumed_at=utc_now(),
+        )
+        for job in jobs:
+            self._queue.put(job)
+        with span("run.resume", {"run.id": run_id, "recovery.job_count": len(jobs), **runtime_attributes()}):
+            pass
+        return len(jobs)
 
     def cancel(self, run_id: str) -> None:
         self.store.update_state(run_id, cancel_requested=True, status="cancelling")
@@ -340,27 +516,67 @@ class RunQueue:
             if job is None:
                 return
             try:
-                state = self.store.state(job.run_id)
-                if state.get("cancel_requested"):
-                    self._finish_skipped(job)
-                    continue
-                manifest = self.store.manifest(job.run_id)
-                budget = manifest.get("config", {}).get("max_budget_usd")
-                spent = sum(float(row.get("cost_usd") or 0) for row in self.store.results(job.run_id))
-                if budget is not None and spent >= float(budget):
-                    self.store.update_state(job.run_id, cancel_requested=True, status="budget_exhausted")
-                    self._finish_skipped(job)
-                    continue
-                existing = {row.get("attempt_id") for row in self.store.results(job.run_id)}
-                if job.attempt_id in existing:
-                    continue
-                self.store.mutate_state(job.run_id, lambda value: _start_job(value, job))
-                result = self._execute(job)
-                self.store.append_result(job.run_id, result)
-                self.store.mutate_state(job.run_id, lambda value: _finish_job(value, result.get("status") == "ok", job.attempt_id))
-                self._refresh_report(job.run_id)
-                if _can_model_review(result):
-                    self._review_queue.put(ReviewJob(job.run_id, job.attempt_id))
+                with span(
+                    "eval.job",
+                    {
+                        "run.id": job.run_id,
+                        "eval.attempt_id": job.attempt_id,
+                        "eval.id": job.eval_id,
+                        "eval.condition": job.condition,
+                        "eval.repetition": job.repetition,
+                        "gen_ai.request.model": job.model,
+                        "queue.depth": self._queue.qsize(),
+                        **runtime_attributes(),
+                    },
+                ) as current:
+                    state = self.store.state(job.run_id)
+                    if state.get("cancel_requested"):
+                        self._finish_skipped(job)
+                        set_attributes(current, {"eval.status": "cancelled"})
+                        continue
+                    manifest = self.store.manifest(job.run_id)
+                    budget = manifest.get("config", {}).get("max_budget_usd")
+                    existing, spent = self.store.result_summary(job.run_id)
+                    set_attributes(current, {"run.recorded_spend_usd": spent, "run.max_budget_usd": budget})
+                    if budget is not None and spent >= float(budget):
+                        self.store.update_state(job.run_id, cancel_requested=True, status="budget_exhausted")
+                        self._finish_skipped(job)
+                        set_attributes(current, {"eval.status": "budget_exhausted"})
+                        continue
+                    if job.attempt_id in existing:
+                        set_attributes(current, {"eval.status": "duplicate_skipped"})
+                        continue
+                    self.store.mutate_state(job.run_id, lambda value: _start_job(value, job))
+                    result = self._execute(job)
+                    self.store.append_result(job.run_id, result)
+                    final_state = self.store.mutate_state(
+                        job.run_id,
+                        lambda value: _finish_job(value, result.get("status") == "ok", job.attempt_id),
+                    )
+                    completed = final_state.get("status") in {"completed", "completed_with_errors", "cancelled"}
+                    self._refresh_report(job.run_id, force=completed)
+                    set_attributes(
+                        current,
+                        {
+                            "eval.status": result.get("status"),
+                            "eval.score": result.get("grade", {}).get("score"),
+                            "eval.passed": result.get("grade", {}).get("pass"),
+                            "eval.latency_seconds": result.get("latency_seconds"),
+                            "gen_ai.response.model": result.get("resolved_model"),
+                            "gen_ai.usage.input_tokens": result.get("usage", {}).get("prompt_tokens"),
+                            "gen_ai.usage.output_tokens": result.get("usage", {}).get("completion_tokens"),
+                            "gen_ai.usage.total_tokens": result.get("usage", {}).get("total_tokens"),
+                            "quinnferno.cost_usd": result.get("cost_usd"),
+                            "openrouter.provider": result.get("provider"),
+                            "queue.review_depth": self._review_queue.qsize(),
+                            **runtime_attributes(),
+                        },
+                    )
+                    if completed:
+                        with span("memory.trim", {"run.id": job.run_id}) as memory_span:
+                            set_attributes(memory_span, trim_memory())
+                    if _can_model_review(result):
+                        self._review_queue.put(ReviewJob(job.run_id, job.attempt_id))
             except Exception as exc:  # worker containment boundary
                 try:
                     result = self._error_result(job, exc)
@@ -378,7 +594,28 @@ class RunQueue:
             if job is None:
                 return
             try:
-                self._execute_review(job)
+                with span(
+                    "eval.review",
+                    {
+                        "run.id": job.run_id,
+                        "eval.attempt_id": job.attempt_id,
+                        "gen_ai.request.model": self.judge_model,
+                        "queue.review_depth": self._review_queue.qsize(),
+                        **runtime_attributes(),
+                    },
+                ) as current:
+                    review = self._execute_review(job)
+                    if review:
+                        set_attributes(
+                            current,
+                            {
+                                "review.status": review.get("status", "ok"),
+                                "review.score": review.get("score"),
+                                "quinnferno.cost_usd": review.get("cost_usd"),
+                                "gen_ai.usage.total_tokens": review.get("usage", {}).get("total_tokens"),
+                                **runtime_attributes(),
+                            },
+                        )
             except Exception as exc:
                 append_jsonl(
                     self.store.run_dir(job.run_id) / "judge-errors.jsonl",
@@ -388,30 +625,31 @@ class RunQueue:
             finally:
                 self._review_queue.task_done()
 
-    def _execute_review(self, job: ReviewJob) -> None:
+    def _execute_review(self, job: ReviewJob) -> dict[str, Any] | None:
         reviews_path = self.store.run_dir(job.run_id) / "reviews.jsonl"
         if any(
             row.get("attempt_id") == job.attempt_id and row.get("reviewer_type") == "model"
             for row in read_jsonl(reviews_path)
         ):
-            return
-        result = next((row for row in self.store.results(job.run_id) if row.get("attempt_id") == job.attempt_id), None)
+            return None
+        result = self.store.result(job.run_id, job.attempt_id)
         if not result or not _can_model_review(result):
-            return
+            return None
         manifest = self.store.manifest(job.run_id)
         budget = manifest.get("config", {}).get("max_budget_usd")
-        inference_spend = sum(float(row.get("cost_usd") or 0) for row in self.store.results(job.run_id))
+        _, inference_spend = self.store.result_summary(job.run_id)
         review_spend = sum(float(row.get("cost_usd") or 0) for row in read_jsonl(reviews_path) if row.get("reviewer_type") == "model")
         if budget is not None and inference_spend + review_spend >= float(budget):
+            receipt = {
+                "attempt_id": job.attempt_id, "reviewed_at": utc_now(), "reviewer_type": "model",
+                "judge_model": self.judge_model, "status": "skipped_budget", "cost_usd": 0,
+            }
             append_jsonl(
                 reviews_path,
-                {
-                    "attempt_id": job.attempt_id, "reviewed_at": utc_now(), "reviewer_type": "model",
-                    "judge_model": self.judge_model, "status": "skipped_budget", "cost_usd": 0,
-                },
+                receipt,
                 self.store.lock(job.run_id),
             )
-            return
+            return receipt
         eval_manifest = next(row for row in manifest.get("evals", []) if row.get("id") == result.get("eval_id"))
         with self._model_limit(self.judge_model):
             completion = self.client.complete_messages(
@@ -423,24 +661,26 @@ class RunQueue:
                 reasoning="high",
             )
         judged = parse_judge_output(completion.text)
+        receipt = {
+            "attempt_id": job.attempt_id,
+            "reviewed_at": utc_now(),
+            "reviewer_type": "model",
+            "judge_model": self.judge_model,
+            "score": judged["score"],
+            "verdict": judged["verdict"],
+            "rationale": judged["rationale"],
+            "rubric_scores": judged["rubric_scores"],
+            "usage": completion.usage,
+            "cost_usd": float(completion.usage.get("cost") or 0),
+            "response_id": completion.response_id,
+        }
         append_jsonl(
             reviews_path,
-            {
-                "attempt_id": job.attempt_id,
-                "reviewed_at": utc_now(),
-                "reviewer_type": "model",
-                "judge_model": self.judge_model,
-                "score": judged["score"],
-                "verdict": judged["verdict"],
-                "rationale": judged["rationale"],
-                "rubric_scores": judged["rubric_scores"],
-                "usage": completion.usage,
-                "cost_usd": float(completion.usage.get("cost") or 0),
-                "response_id": completion.response_id,
-            },
+            receipt,
             self.store.lock(job.run_id),
         )
         self._refresh_report(job.run_id)
+        return receipt
 
     def _finish_skipped(self, job: Job) -> None:
         result = self._error_result(job, RuntimeError("Run cancelled"), status="cancelled")
@@ -574,12 +814,27 @@ class RunQueue:
             "grade": {"score": 0.0, "pass": False, "verdict": "Request failed", "human_required": False},
         }
 
-    def _refresh_report(self, run_id: str) -> None:
+    def _refresh_report(self, run_id: str, *, force: bool = False) -> None:
+        now = time.monotonic()
+        with self._report_guard:
+            previous = self._report_last.get(run_id, 0.0)
+            if not force and now - previous < self.report_interval_seconds:
+                return
+            self._report_last[run_id] = now
         try:
             from .reporting_v1 import write_v1_reports
 
-            with self.store.lock(run_id):
-                write_v1_reports(self.store.run_dir(run_id), self.suite)
+            with span("report.refresh", {"run.id": run_id, "report.forced": force, **runtime_attributes()}) as current:
+                with self.store.lock(run_id):
+                    paths = write_v1_reports(self.store.run_dir(run_id), self.suite)
+                set_attributes(
+                    current,
+                    {
+                        "report.json_bytes": paths["json"].stat().st_size,
+                        "report.markdown_bytes": paths["markdown"].stat().st_size,
+                        **runtime_attributes(),
+                    },
+                )
         except Exception:
             # Results are canonical. A report can always be rebuilt later.
             return
@@ -632,6 +887,9 @@ def build_queue_from_env(store: RunStore | None = None) -> RunQueue:
     per_model_workers = int(os.environ.get("QUINNFERNO_PER_MODEL_WORKERS", "3"))
     judge_model = os.environ.get("QUINNFERNO_JUDGE_MODEL", "openai/gpt-5.6-luna-pro")
     judge_workers = int(os.environ.get("QUINNFERNO_JUDGE_WORKERS", "2"))
+    max_auto_recoveries = int(os.environ.get("QUINNFERNO_MAX_AUTO_RECOVERIES", "3"))
+    recovery_window_seconds = int(os.environ.get("QUINNFERNO_RECOVERY_WINDOW_SECONDS", "3600"))
+    report_interval_seconds = int(os.environ.get("QUINNFERNO_REPORT_INTERVAL_SECONDS", "30"))
     return RunQueue(
         key,
         store=store,
@@ -639,6 +897,9 @@ def build_queue_from_env(store: RunStore | None = None) -> RunQueue:
         per_model_workers=per_model_workers,
         judge_model=judge_model,
         judge_workers=judge_workers,
+        max_auto_recoveries=max_auto_recoveries,
+        recovery_window_seconds=recovery_window_seconds,
+        report_interval_seconds=report_interval_seconds,
     )
 
 

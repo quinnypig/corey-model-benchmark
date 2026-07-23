@@ -8,6 +8,10 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from opentelemetry.trace import SpanKind
+
+from .telemetry import set_attributes, span
+
 
 @dataclass(frozen=True)
 class Completion:
@@ -57,27 +61,36 @@ class OpenRouterClient:
         self.attempts = attempts
 
     def list_models(self) -> list[dict[str, Any]]:
-        request = urllib.request.Request(
-            f"{self.base_url}/models/user",
-            method="GET",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "HTTP-Referer": "https://github.com/quinnypig/corey-model-benchmark",
-                "X-Title": "Quinnferno",
-            },
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                raw = json.loads(response.read())
-        except urllib.error.HTTPError as exc:
-            error_body = exc.read().decode("utf-8", errors="replace")[:2000]
-            raise OpenRouterError(f"OpenRouter model catalog failed with HTTP {exc.code}: {error_body}") from exc
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise OpenRouterError(f"OpenRouter model catalog failed: {exc}") from exc
-        data = raw.get("data") if isinstance(raw, dict) else None
-        if not isinstance(data, list):
-            raise OpenRouterError("OpenRouter model catalog returned an invalid response: expected a data array")
-        return [item for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)]
+        with span(
+            "openrouter.models.list",
+            {"server.address": "openrouter.ai", "http.request.method": "GET"},
+            kind=SpanKind.CLIENT,
+        ) as current:
+            request = urllib.request.Request(
+                f"{self.base_url}/models/user",
+                method="GET",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "HTTP-Referer": "https://github.com/quinnypig/corey-model-benchmark",
+                    "X-Title": "Quinnferno",
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    raw = json.loads(response.read())
+                    set_attributes(current, {"http.response.status_code": getattr(response, "status", 200)})
+            except urllib.error.HTTPError as exc:
+                set_attributes(current, {"http.response.status_code": exc.code})
+                error_body = exc.read().decode("utf-8", errors="replace")[:2000]
+                raise OpenRouterError(f"OpenRouter model catalog failed with HTTP {exc.code}: {error_body}") from exc
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                raise OpenRouterError(f"OpenRouter model catalog failed: {exc}") from exc
+            data = raw.get("data") if isinstance(raw, dict) else None
+            if not isinstance(data, list):
+                raise OpenRouterError("OpenRouter model catalog returned an invalid response: expected a data array")
+            models = [item for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)]
+            set_attributes(current, {"openrouter.model_count": len(models)})
+            return models
 
     def require_models_available(self, models: list[str]) -> None:
         """Verify exact model IDs against the API key's routing policy."""
@@ -139,57 +152,105 @@ class OpenRouterClient:
         return self._send_completion(payload)
 
     def _send_completion(self, payload: dict[str, Any]) -> Completion:
-        body = json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/quinnypig/corey-model-benchmark",
-                "X-Title": "Quinnferno",
+        with span(
+            "gen_ai.chat",
+            {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.provider.name": "openrouter",
+                "gen_ai.request.model": payload.get("model"),
+                "gen_ai.request.max_tokens": payload.get("max_tokens"),
+                "gen_ai.request.temperature": payload.get("temperature"),
+                "gen_ai.request.seed": payload.get("seed"),
+                "gen_ai.request.message_count": len(payload.get("messages", [])),
+                "gen_ai.request.web_search": bool(payload.get("tools")),
+                "server.address": "openrouter.ai",
+                "http.request.method": "POST",
             },
-        )
-        last_retry_after = 0.0
-        for attempt in range(1, self.attempts + 1):
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    raw = json.loads(response.read())
-                choices = raw.get("choices")
-                if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-                    raise OpenRouterError("OpenRouter returned HTTP 200 without a usable completion choice")
-                choice = choices[0]
-                message = choice.get("message", {})
-                if not isinstance(message, dict):
-                    raise OpenRouterError("OpenRouter returned a completion choice without a usable message")
-                return Completion(
-                    text=_content_to_text(message.get("content")),
-                    response_id=raw.get("id"),
-                    provider=raw.get("provider"),
-                    usage=raw.get("usage") or {},
-                    raw_model=raw.get("model"),
-                    reasoning=message.get("reasoning"),
-                    finish_reason=choice.get("finish_reason"),
-                    native_finish_reason=choice.get("native_finish_reason"),
-                    annotations=message.get("annotations") if isinstance(message.get("annotations"), list) else [],
-                    request_attempts=attempt,
-                )
-            except urllib.error.HTTPError as exc:
-                error_body = exc.read().decode("utf-8", errors="replace")[:2000]
-                retryable = exc.code == 429 or exc.code >= 500
-                retry_header = exc.headers.get("Retry-After") if exc.headers else None
+            kind=SpanKind.CLIENT,
+        ) as current:
+            body = json.dumps(payload).encode("utf-8")
+            request = urllib.request.Request(
+                f"{self.base_url}/chat/completions",
+                data=body,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/quinnypig/corey-model-benchmark",
+                    "X-Title": "Quinnferno",
+                },
+            )
+            last_retry_after = 0.0
+            for attempt in range(1, self.attempts + 1):
+                retry_status = 0
+                retry_error = ""
                 try:
-                    last_retry_after = min(120.0, max(0.0, float(retry_header))) if retry_header else 0.0
-                except ValueError:
-                    last_retry_after = 0.0
-                if not retryable or attempt == self.attempts:
-                    raise OpenRouterError(f"OpenRouter HTTP {exc.code}: {error_body}") from exc
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-                if attempt == self.attempts:
-                    raise OpenRouterError(f"OpenRouter request failed: {exc}") from exc
-            delay = max(last_retry_after, min(20.0, 2 ** (attempt - 1)) + random.random())
-            time.sleep(delay)
+                    with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                        raw = json.loads(response.read())
+                        set_attributes(current, {"http.response.status_code": getattr(response, "status", 200)})
+                    choices = raw.get("choices")
+                    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                        raise OpenRouterError("OpenRouter returned HTTP 200 without a usable completion choice")
+                    choice = choices[0]
+                    message = choice.get("message", {})
+                    if not isinstance(message, dict):
+                        raise OpenRouterError("OpenRouter returned a completion choice without a usable message")
+                    usage = raw.get("usage") or {}
+                    set_attributes(
+                        current,
+                        {
+                            "gen_ai.response.id": raw.get("id"),
+                            "gen_ai.response.model": raw.get("model"),
+                            "gen_ai.response.finish_reasons": [choice.get("finish_reason") or "unknown"],
+                            "gen_ai.usage.input_tokens": usage.get("prompt_tokens"),
+                            "gen_ai.usage.output_tokens": usage.get("completion_tokens"),
+                            "gen_ai.usage.total_tokens": usage.get("total_tokens"),
+                            "quinnferno.cost_usd": usage.get("cost"),
+                            "openrouter.provider": raw.get("provider"),
+                            "openrouter.request_attempts": attempt,
+                            "openrouter.retry_count": attempt - 1,
+                        },
+                    )
+                    return Completion(
+                        text=_content_to_text(message.get("content")),
+                        response_id=raw.get("id"),
+                        provider=raw.get("provider"),
+                        usage=usage,
+                        raw_model=raw.get("model"),
+                        reasoning=message.get("reasoning"),
+                        finish_reason=choice.get("finish_reason"),
+                        native_finish_reason=choice.get("native_finish_reason"),
+                        annotations=message.get("annotations") if isinstance(message.get("annotations"), list) else [],
+                        request_attempts=attempt,
+                    )
+                except urllib.error.HTTPError as exc:
+                    retry_status = exc.code
+                    retry_error = "http"
+                    error_body = exc.read().decode("utf-8", errors="replace")[:2000]
+                    retryable = exc.code == 429 or exc.code >= 500
+                    retry_header = exc.headers.get("Retry-After") if exc.headers else None
+                    try:
+                        last_retry_after = min(120.0, max(0.0, float(retry_header))) if retry_header else 0.0
+                    except ValueError:
+                        last_retry_after = 0.0
+                    set_attributes(current, {"http.response.status_code": exc.code})
+                    if not retryable or attempt == self.attempts:
+                        raise OpenRouterError(f"OpenRouter HTTP {exc.code}: {error_body}") from exc
+                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                    retry_error = type(exc).__name__
+                    if attempt == self.attempts:
+                        raise OpenRouterError(f"OpenRouter request failed: {exc}") from exc
+                delay = max(last_retry_after, min(20.0, 2 ** (attempt - 1)) + random.random())
+                current.add_event(
+                    "openrouter.retry",
+                    {
+                        "retry.attempt": attempt,
+                        "retry.delay_seconds": delay,
+                        "retry.http_status_code": retry_status,
+                        "retry.error_type": retry_error,
+                    },
+                )
+                time.sleep(delay)
         raise AssertionError("unreachable")
 
     def complete(

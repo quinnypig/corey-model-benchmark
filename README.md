@@ -89,6 +89,24 @@ Platypus SVGs are size-limited, parsed as XML, and rejected if they contain docu
 
 The current “agentic” coding treatment performs up to ten model repair loops from deterministic static gate feedback. It does not claim browser/visual verification; adding an isolated Chromium worker is a future protocol version, not a silent methodology change.
 
+## Operations and spend safety
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` to an OpenTelemetry Collector base URL (for
+example, `http://otel-collector.monitoring:4318`) to export Flask, queue startup,
+run submission/recovery, eval job, OpenRouter chat/retry, model-judge, report,
+cost, token, and process/cgroup memory spans. Health probes are excluded and
+prompt or response bodies are never attached to spans. If no collector is
+configured, `HONEYCOMB_API_KEY` enables direct OTLP/HTTP export to Honeycomb.
+
+Incomplete runs normally recover after a restart. Quinnferno persists recovery
+history and pauses a run after three automatic recoveries in one hour by
+default, bounding repeated paid calls during a crashloop. The run page explains
+the fuse and offers an explicit resume action. Tune this with
+`QUINNFERNO_MAX_AUTO_RECOVERIES` and `QUINNFERNO_RECOVERY_WINDOW_SECONDS`.
+Reports are rebuilt at most every 30 seconds while a run is active and forced
+at completion, avoiding the allocator pressure caused by materializing a
+growing receipt ledger after every result.
+
 ## Private inputs still needed for publication-grade runs
 
 The harness is complete, but several editorial ground truths cannot be manufactured by code:

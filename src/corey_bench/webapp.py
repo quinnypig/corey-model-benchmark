@@ -17,10 +17,10 @@ from .cli import _load_dotenv
 from .costing import estimate_run_cost
 from .model_cards import build_model_cards
 from .openrouter import OpenRouterError
-from .protocol import load_protocol
 from .reporting_v1 import build_report_data, write_v1_reports
 from .responses import response_records
 from .runner import RunConfig, RunQueue, RunStore, append_jsonl, build_queue_from_env, suite_request_count
+from .telemetry import instrument_flask, runtime_attributes
 
 
 FULL_CONDITIONS = ["weights-only", "search-enabled", "agentic"]
@@ -63,6 +63,7 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
         SECRET_KEY=os.environ.get("QUINNFERNO_SECRET_KEY") or secrets.token_hex(32),
         MAX_CONTENT_LENGTH=1_000_000,
     )
+    instrument_flask(app)
     root = Path(runs_root or os.environ.get("QUINNFERNO_RUNS", "runs")).resolve()
     store = run_queue.store if run_queue else RunStore(root)
     queue_manager = run_queue or build_queue_from_env(store)
@@ -249,6 +250,15 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
         queue_manager.cancel(run_id)
         return redirect(url_for("run_detail", run_id=run_id))
 
+    @app.post("/runs/<run_id>/resume")
+    def resume_run(run_id: str) -> Response:
+        _run_dir(store, run_id)
+        try:
+            queue_manager.resume(run_id)
+        except ValueError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("run_detail", run_id=run_id))
+
     @app.get("/runs/<run_id>/report.md")
     def markdown_report(run_id: str) -> Response:
         run_dir = _run_dir(store, run_id)
@@ -366,6 +376,7 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
             "review_queue_depth": queue_manager._review_queue.qsize() if hasattr(queue_manager, "_review_queue") else 0,
             "workers": getattr(queue_manager, "workers", None),
             "per_model_workers": getattr(queue_manager, "per_model_workers", None),
+            "runtime": runtime_attributes(),
         })
 
     @app.get("/readyz")
