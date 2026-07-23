@@ -106,6 +106,7 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
         return render_template(
             "models.html",
             cards=cards,
+            rankable_count=sum(card["rankable"] for card in cards),
             run_count=len({run["run_id"] for card in cards for run in card["runs"]}),
             attempt_count=sum(card["total_attempts"] for card in cards),
             total_cost=sum(card["total_cost"] for card in cards),

@@ -77,6 +77,7 @@ The full suite is intentionally large. Tier 7's coin test alone makes 300 fresh-
 - Factual/security headline aggregation is minimum/all-pass; creative aggregation is best-of-three but every attempt and its cost remains visible.
 - Calibration uses a strict final `Confidence: N%` line. Missing confidence is missing, never silently converted to zero.
 - Human-required scores remain unresolved until a model or human rubric review lands; deferred scores remain unresolved until their registered outcome exists. Quinnferno reports provisional points over resolved weight and emits `/100` only after all weighted judgments resolve.
+- A model card is ranked only after all 97 required per-model attempt receipts in the complete suite matrix are present and all weighted judgments resolve. Partial runs remain browsable, but their extrapolated score is withheld from comparison tables.
 - Tier 7 never contributes to `/100`.
 
 The frozen weighting policy is encoded in `benchmarks/quinn_v1.json` and validated to total exactly 100 points across Tiers 1–6.

@@ -36,21 +36,35 @@ def build_model_cards(
                     "id": model_id,
                     "name": metadata.get(model_id, {}).get("name") or model_id,
                     "metadata": metadata.get(model_id, {}),
+                    "suite_version": suite.version,
                     "runs": [],
                 },
             )
             resolved_weight = float(model_report.get("resolved_weight") or 0)
             weighted_points = float(model_report.get("weighted_points") or 0)
+            provisional_score = weighted_points / resolved_weight * 100 if resolved_weight else None
             run = {
                 "run_id": run_id,
                 "created_at": state.get("created_at") or report.get("created_at"),
                 "status": state.get("status", "unknown"),
                 "completed_jobs": state.get("completed_jobs", 0),
                 "expected_jobs": state.get("expected_jobs", report.get("expected_jobs", 0)),
-                "score_percent": weighted_points / resolved_weight * 100 if resolved_weight else None,
+                "score_percent": model_report.get("final_score") if model_report.get("rankable") else None,
+                "provisional_score_percent": provisional_score,
                 "weighted_points": weighted_points,
                 "resolved_weight": resolved_weight,
                 "final_score": model_report.get("final_score"),
+                "rankable": bool(model_report.get("rankable")),
+                "full_suite_complete": bool(model_report.get("full_suite_complete")),
+                "full_suite_scheduled": bool(model_report.get("full_suite_scheduled")),
+                "protocol_current": bool(model_report.get("protocol_current")),
+                "protocol_version": model_report.get("protocol_version"),
+                "required_attempts": int(model_report.get("required_attempts") or 0),
+                "scheduled_required_attempts": int(model_report.get("scheduled_required_attempts") or 0),
+                "completed_required_attempts": int(model_report.get("completed_required_attempts") or 0),
+                "missing_test_count": int(model_report.get("missing_test_count") or 0),
+                "missing_tests": model_report.get("missing_tests", []),
+                "missing_eval_ids": model_report.get("missing_eval_ids", []),
                 "total_cost": float(model_report.get("total_cost") or 0),
                 "dollars_per_point": model_report.get("dollars_per_point"),
                 "median_latency": model_report.get("median_latency"),
@@ -65,10 +79,14 @@ def build_model_cards(
     for card in cards.values():
         card["runs"].sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
         card["latest_run"] = card["runs"][0]
-        # Prefer the run with the broadest resolved coverage. Recency breaks ties.
+        # A complete current-protocol run always outranks partial evidence.
         card["representative_run"] = max(
             card["runs"],
             key=lambda row: (
+                row["rankable"],
+                row["full_suite_complete"],
+                row["protocol_current"],
+                row["completed_required_attempts"],
                 row["resolved_weight"],
                 row["completed_attempts"],
                 str(row.get("created_at") or ""),
@@ -79,14 +97,16 @@ def build_model_cards(
         card["total_attempts"] = sum(row["completed_attempts"] for row in card["runs"])
         card["failed_attempts"] = sum(row["failed_attempts"] for row in card["runs"])
         card["total_tokens"] = sum(row["total_tokens"] for row in card["runs"])
+        card["valid"] = card["representative_run"]["full_suite_complete"]
+        card["rankable"] = card["representative_run"]["rankable"]
         card["eval_profile"] = _eval_profile(card["representative_run"]["evals"])
 
     return sorted(
         cards.values(),
         key=lambda card: (
-            card["representative_run"]["score_percent"] is None,
+            not card["rankable"],
             -(card["representative_run"]["score_percent"] or 0),
-            -card["representative_run"]["resolved_weight"],
+            -card["representative_run"]["completed_required_attempts"],
             card["name"].casefold(),
         ),
     )

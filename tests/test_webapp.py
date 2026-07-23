@@ -112,8 +112,13 @@ class WebAppTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertIn(b'"models"', response.data)
                 client = app.test_client()
-                self.assertIn(b"Tested model roster", client.get("/models").data)
-                self.assertIn(b"Capability profile", client.get("/models/example/model").data)
+                models_page = client.get("/models").data
+                self.assertIn(b"Tested model roster", models_page)
+                self.assertIn(b"not ranked", models_page)
+                model_page = client.get("/models/example/model").data
+                self.assertIn(b"Capability profile", model_page)
+                self.assertIn(b"not yet a valid model card", model_page)
+                self.assertIn(b"1 of 97 required attempts", model_page)
                 self.assertIn(b"ALLOWED", client.get("/responses?model=example/model&eval=3.2").data)
                 exported = client.get("/models/example/model/responses.jsonl")
                 self.assertEqual(exported.status_code, 200)
