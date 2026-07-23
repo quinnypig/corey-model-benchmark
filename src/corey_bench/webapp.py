@@ -236,7 +236,15 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
         manifest = store.manifest(run_id)
         results = store.results(run_id)
         report = build_report_data(run_dir, suite) if results else None
-        return render_template("run.html", state=state, manifest=manifest, results=results, report=report)
+        diagnostics = _run_diagnostics(run_dir, results)
+        return render_template(
+            "run.html",
+            state=state,
+            manifest=manifest,
+            results=results,
+            report=report,
+            diagnostics=diagnostics,
+        )
 
     @app.get("/api/runs/<run_id>")
     def run_status(run_id: str) -> Response:
@@ -256,6 +264,26 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
         _run_dir(store, run_id)
         try:
             queue_manager.resume(run_id)
+        except ValueError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.post("/runs/<run_id>/retry-errors")
+    def retry_run_errors(run_id: str) -> Response:
+        _run_dir(store, run_id)
+        try:
+            count = queue_manager.retry_execution_errors(run_id)
+            flash(f"Queued {count} execution-error attempt{'s' if count != 1 else ''} for repair.")
+        except ValueError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.post("/runs/<run_id>/retry-reviews")
+    def retry_run_reviews(run_id: str) -> Response:
+        _run_dir(store, run_id)
+        try:
+            count = queue_manager.retry_pending_reviews(run_id)
+            flash(f"Queued {count} unresolved model judgment{'s' if count != 1 else ''} for repair.")
         except ValueError as exc:
             flash(str(exc), "error")
         return redirect(url_for("run_detail", run_id=run_id))
@@ -451,6 +479,54 @@ def _read_reviews(path: Path) -> list[dict[str, Any]]:
     from .runner import read_jsonl
 
     return read_jsonl(path)
+
+
+def _run_diagnostics(run_dir: Path, results: list[dict[str, Any]]) -> dict[str, Any]:
+    execution_errors = [row for row in results if row.get("status") == "error"]
+    test_failures = [
+        row
+        for row in results
+        if row.get("status") not in {"error", "cancelled"}
+        and row.get("grade", {}).get("pass") is False
+    ]
+    reviews = _read_reviews(run_dir / "reviews.jsonl")
+    scored_reviews = {
+        str(row.get("attempt_id"))
+        for row in reviews
+        if isinstance(row.get("score"), (int, float))
+    }
+    latest_reviews: dict[str, dict[str, Any]] = {}
+    for row in reviews:
+        if row.get("reviewer_type") == "model" and row.get("attempt_id"):
+            latest_reviews[str(row["attempt_id"])] = row
+    judge_error_counts: dict[str, int] = {}
+    for row in _read_reviews(run_dir / "judge-errors.jsonl"):
+        attempt_id = str(row.get("attempt_id") or "")
+        if attempt_id:
+            judge_error_counts[attempt_id] = judge_error_counts.get(attempt_id, 0) + 1
+    pending_reviews = []
+    for row in results:
+        attempt_id = str(row.get("attempt_id") or "")
+        if (
+            row.get("status") == "ok"
+            and row.get("grade", {}).get("human_required")
+            and attempt_id not in scored_reviews
+        ):
+            latest = latest_reviews.get(attempt_id, {})
+            pending_reviews.append(
+                {
+                    **row,
+                    "review_status": latest.get("status") or "queued",
+                    "review_error": latest.get("error"),
+                    "judge_error_count": judge_error_counts.get(attempt_id, 0),
+                }
+            )
+    return {
+        "execution_errors": execution_errors,
+        "test_failures": test_failures,
+        "blocked_tests": [row for row in test_failures if row.get("status") == "blocked"],
+        "pending_reviews": pending_reviews,
+    }
 
 
 def _now() -> str:

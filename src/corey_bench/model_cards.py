@@ -8,7 +8,13 @@ from .reporting_v1 import build_report_data
 from .runner import RunStore
 
 
-TERMINAL_STATUSES = {"completed", "completed_with_errors", "cancelled", "budget_exhausted"}
+TERMINAL_STATUSES = {
+    "completed",
+    "execution_errors",
+    "completed_with_errors",  # legacy state, migrated on queue startup
+    "cancelled",
+    "budget_exhausted",
+}
 
 
 def build_model_cards(
@@ -71,6 +77,8 @@ def build_model_cards(
                 "total_tokens": int(model_report.get("total_tokens") or 0),
                 "completed_attempts": int(model_report.get("completed_attempts") or 0),
                 "failed_attempts": int(model_report.get("failed_attempts") or 0),
+                "benchmark_failed_attempts": int(model_report.get("benchmark_failed_attempts") or 0),
+                "execution_error_attempts": int(model_report.get("execution_error_attempts") or 0),
                 "evals": model_report.get("evals", []),
                 "terminal": state.get("status") in TERMINAL_STATUSES,
             }
@@ -96,6 +104,7 @@ def build_model_cards(
         card["total_cost"] = sum(row["total_cost"] for row in card["runs"])
         card["total_attempts"] = sum(row["completed_attempts"] for row in card["runs"])
         card["failed_attempts"] = sum(row["failed_attempts"] for row in card["runs"])
+        card["execution_error_attempts"] = sum(row["execution_error_attempts"] for row in card["runs"])
         card["total_tokens"] = sum(row["total_tokens"] for row in card["runs"])
         card["valid"] = card["representative_run"]["full_suite_complete"]
         card["rankable"] = card["representative_run"]["rankable"]

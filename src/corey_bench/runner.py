@@ -15,7 +15,7 @@ from typing import Any
 from .artifacts import ArtifactError, extract_code, salvage_svg_preview, validate_svg, write_svg_preview
 from .graders import grade_attempt
 from .judging import JudgeOutputError, judge_messages, parse_judge_output
-from .openrouter import OpenRouterClient, OpenRouterError
+from .openrouter import OpenRouterClient, OpenRouterError, OpenRouterPolicyError
 from .protocol import EvalDefinition, EvalSuite, RenderedEval, load_protocol
 from .telemetry import runtime_attributes, set_attributes, span, trim_memory
 
@@ -52,6 +52,19 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def collapse_result_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the latest append-only receipt for each logical attempt."""
+    latest: dict[str, dict[str, Any]] = {}
+    anonymous: list[dict[str, Any]] = []
+    for row in rows:
+        attempt_id = str(row.get("attempt_id") or "")
+        if attempt_id:
+            latest[attempt_id] = row
+        else:
+            anonymous.append(row)
+    return [*latest.values(), *anonymous]
+
+
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -86,6 +99,7 @@ class Job:
 class ReviewJob:
     run_id: str
     attempt_id: str
+    force: bool = False
 
 
 class RunStore:
@@ -179,7 +193,7 @@ class RunStore:
 
     def results(self, run_id: str) -> list[dict[str, Any]]:
         with self.lock(run_id):
-            return read_jsonl(self.run_dir(run_id) / "results.jsonl")
+            return collapse_result_rows(read_jsonl(self.run_dir(run_id) / "results.jsonl"))
 
     def result_summary(self, run_id: str) -> tuple[set[str], float]:
         """Stream the large receipt ledger instead of materializing it in every worker."""
@@ -204,6 +218,7 @@ class RunStore:
 
     def result(self, run_id: str, attempt_id: str) -> dict[str, Any] | None:
         path = self.run_dir(run_id) / "results.jsonl"
+        matched = None
         with self.lock(run_id):
             if not path.exists():
                 return None
@@ -216,27 +231,11 @@ class RunStore:
                     except json.JSONDecodeError as exc:
                         raise ValueError(f"Invalid JSONL {path}:{number}: {exc}") from exc
                     if row.get("attempt_id") == attempt_id:
-                        return row
-        return None
+                        matched = row
+        return matched
 
     def reviewable_attempt_ids(self, run_id: str) -> list[str]:
-        """Stream review eligibility without retaining every large response receipt."""
-        attempt_ids: list[str] = []
-        path = self.run_dir(run_id) / "results.jsonl"
-        with self.lock(run_id):
-            if not path.exists():
-                return attempt_ids
-            with path.open(encoding="utf-8") as handle:
-                for number, line in enumerate(handle, 1):
-                    if not line.strip():
-                        continue
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        raise ValueError(f"Invalid JSONL {path}:{number}: {exc}") from exc
-                    if _can_model_review(row):
-                        attempt_ids.append(str(row["attempt_id"]))
-        return attempt_ids
+        return [str(row["attempt_id"]) for row in self.results(run_id) if _can_model_review(row)]
 
     def recent(self) -> list[dict[str, Any]]:
         runs = []
@@ -307,6 +306,7 @@ def suite_request_count(
 
 class RunQueue:
     SVG_ARTIFACT_VERSION = 3
+    RESULT_SEMANTICS_VERSION = 2
 
     def __init__(
         self,
@@ -363,6 +363,7 @@ class RunQueue:
             },
         ) as current:
             self._started = True
+            migrated_results = self._migrate_result_semantics()
             rebuilt_artifacts = self._rebuild_svg_artifacts()
             for number in range(self.workers):
                 thread = threading.Thread(target=self._worker, name=f"quinnferno-worker-{number+1}", daemon=True)
@@ -378,6 +379,7 @@ class RunQueue:
                 current,
                 {
                     **recovery,
+                    **migrated_results,
                     **rebuilt_artifacts,
                     "recovery.review_count": recovered_reviews,
                     "queue.depth": self._queue.qsize(),
@@ -385,6 +387,104 @@ class RunQueue:
                     **runtime_attributes(),
                 },
             )
+
+    def _migrate_result_semantics(self) -> dict[str, int]:
+        """Reclassify legacy model outcomes and reconcile execution health."""
+        migrated_runs = 0
+        policy_outcomes = 0
+        empty_outcomes = 0
+        marker_name = f".result-semantics-v{self.RESULT_SEMANTICS_VERSION}.json"
+        for state in self.store.recent():
+            run_id = state["run_id"]
+            run_dir = self.store.run_dir(run_id)
+            marker = run_dir / marker_name
+            if marker.exists():
+                continue
+            for row in self.store.results(run_id):
+                if row.get("status") != "error":
+                    continue
+                diagnostic = str(row.get("error") or "")
+                replacement = dict(row)
+                if "content_filter" in diagnostic or "considered high risk" in diagnostic:
+                    replacement.update(
+                        {
+                            "status": "blocked",
+                            "outcome_type": "provider_policy_block",
+                            "provider_error": diagnostic,
+                            "grade": {
+                                "score": 0.0,
+                                "pass": False,
+                                "verdict": "Provider safety filter blocked the benchmark prompt",
+                                "human_required": False,
+                            },
+                        }
+                    )
+                    replacement.pop("error", None)
+                    self.store.append_result(run_id, replacement)
+                    policy_outcomes += 1
+                elif "role 'assistant' must not be empty" in diagnostic:
+                    replacement.update(
+                        {
+                            "status": "ok",
+                            "outcome_type": "empty_response",
+                            "diagnostic": diagnostic,
+                            "response": "",
+                            "responses": [""],
+                            "grade": {
+                                "score": 0.0,
+                                "pass": False,
+                                "verdict": "Model returned an empty response",
+                                "human_required": False,
+                            },
+                        }
+                    )
+                    replacement.pop("error", None)
+                    self.store.append_result(run_id, replacement)
+                    empty_outcomes += 1
+            self._reconcile_run_health(run_id)
+            atomic_json(
+                marker,
+                {
+                    "version": self.RESULT_SEMANTICS_VERSION,
+                    "migrated_at": utc_now(),
+                },
+            )
+            migrated_runs += 1
+        return {
+            "result.migrated_run_count": migrated_runs,
+            "result.policy_outcome_count": policy_outcomes,
+            "result.empty_outcome_count": empty_outcomes,
+        }
+
+    def _reconcile_run_health(self, run_id: str) -> dict[str, Any]:
+        results = self.store.results(run_id)
+        execution_errors = [row for row in results if row.get("status") == "error"]
+        cancelled = [row for row in results if row.get("status") == "cancelled"]
+        benchmark_failures = [
+            row
+            for row in results
+            if row.get("status") not in {"error", "cancelled"}
+            and row.get("grade", {}).get("pass") is False
+        ]
+
+        def reconcile(state: dict[str, Any]) -> None:
+            state["completed_jobs"] = len(results)
+            state["successful_jobs"] = len(results) - len(execution_errors) - len(cancelled)
+            state["failed_jobs"] = len(execution_errors)
+            state["execution_error_jobs"] = len(execution_errors)
+            state["cancelled_jobs"] = len(cancelled)
+            state["benchmark_failed_jobs"] = len(benchmark_failures)
+            if len(results) >= int(state.get("expected_jobs") or 0):
+                if state.get("status") == "budget_exhausted":
+                    return
+                if state.get("cancel_requested") or state.get("status") == "cancelled":
+                    state["status"] = "cancelled"
+                elif execution_errors:
+                    state["status"] = "execution_errors"
+                else:
+                    state["status"] = "completed"
+
+        return self.store.mutate_state(run_id, reconcile)
 
     def _rebuild_svg_artifacts(self) -> dict[str, int]:
         """Upgrade stored SVG previews without changing historical grades."""
@@ -501,6 +601,7 @@ class RunQueue:
             run_id = state["run_id"]
             completed, _ = self.store.result_summary(run_id)
             manifest = self.store.manifest(run_id)
+            retry_attempts = set(state.get("retry_attempts") or [])
             now = datetime.now(timezone.utc)
             cutoff = now.timestamp() - self.recovery_window_seconds
             history = []
@@ -538,7 +639,7 @@ class RunQueue:
             )
             added = 0
             for raw in manifest.get("jobs", []):
-                if raw.get("attempt_id") not in completed:
+                if raw.get("attempt_id") not in completed or raw.get("attempt_id") in retry_attempts:
                     self._queue.put(Job(**raw))
                     added += 1
             recovered_runs += 1
@@ -596,6 +697,66 @@ class RunQueue:
             pass
         return len(jobs)
 
+    def retry_execution_errors(self, run_id: str) -> int:
+        state = self.store.state(run_id)
+        if state.get("status") not in {"execution_errors", "completed_with_errors"}:
+            raise ValueError("Run has no terminal execution errors to retry")
+        errors = [row for row in self.store.results(run_id) if row.get("status") == "error"]
+        manifest = self.store.manifest(run_id)
+        jobs_by_id = {str(raw.get("attempt_id")): Job(**raw) for raw in manifest.get("jobs", [])}
+        jobs = [jobs_by_id[str(row.get("attempt_id"))] for row in errors if str(row.get("attempt_id")) in jobs_by_id]
+        if not jobs:
+            raise ValueError("No retryable execution-error receipts were found")
+
+        retry_ids = {job.attempt_id for job in jobs}
+
+        def prepare(value: dict[str, Any]) -> None:
+            value["status"] = "queued"
+            value["cancel_requested"] = False
+            value["completed_jobs"] = max(0, int(value.get("completed_jobs") or 0) - len(jobs))
+            value["failed_jobs"] = max(0, int(value.get("failed_jobs") or 0) - len(jobs))
+            value["execution_error_jobs"] = value["failed_jobs"]
+            value["retry_attempts"] = sorted(set(value.get("retry_attempts") or []) | retry_ids)
+            value["last_error_retry_at"] = utc_now()
+
+        self.store.mutate_state(run_id, prepare)
+        for job in jobs:
+            self._queue.put(job)
+        with span(
+            "run.retry_execution_errors",
+            {"run.id": run_id, "retry.job_count": len(jobs), "queue.depth": self._queue.qsize()},
+        ):
+            pass
+        return len(jobs)
+
+    def retry_pending_reviews(self, run_id: str) -> int:
+        self.store.state(run_id)  # validate the run before reading its ledgers
+        reviews = read_jsonl(self.store.run_dir(run_id) / "reviews.jsonl")
+        scored = {
+            str(row.get("attempt_id"))
+            for row in reviews
+            if isinstance(row.get("score"), (int, float))
+        }
+        attempt_ids = [
+            attempt_id
+            for attempt_id in self.store.reviewable_attempt_ids(run_id)
+            if attempt_id not in scored
+        ]
+        if not attempt_ids:
+            raise ValueError("No unresolved model judgments were found")
+        for attempt_id in attempt_ids:
+            self._review_queue.put(ReviewJob(run_id, attempt_id, force=True))
+        with span(
+            "run.retry_pending_reviews",
+            {
+                "run.id": run_id,
+                "review.retry_count": len(attempt_ids),
+                "queue.review_depth": self._review_queue.qsize(),
+            },
+        ):
+            pass
+        return len(attempt_ids)
+
     def cancel(self, run_id: str) -> None:
         self.store.update_state(run_id, cancel_requested=True, status="cancelling")
 
@@ -626,13 +787,14 @@ class RunQueue:
                     manifest = self.store.manifest(job.run_id)
                     budget = manifest.get("config", {}).get("max_budget_usd")
                     existing, spent = self.store.result_summary(job.run_id)
+                    retry_attempts = set(state.get("retry_attempts") or [])
                     set_attributes(current, {"run.recorded_spend_usd": spent, "run.max_budget_usd": budget})
                     if budget is not None and spent >= float(budget):
                         self.store.update_state(job.run_id, cancel_requested=True, status="budget_exhausted")
                         self._finish_skipped(job)
                         set_attributes(current, {"eval.status": "budget_exhausted"})
                         continue
-                    if job.attempt_id in existing:
+                    if job.attempt_id in existing and job.attempt_id not in retry_attempts:
                         set_attributes(current, {"eval.status": "duplicate_skipped"})
                         continue
                     self.store.mutate_state(job.run_id, lambda value: _start_job(value, job))
@@ -640,9 +802,14 @@ class RunQueue:
                     self.store.append_result(job.run_id, result)
                     final_state = self.store.mutate_state(
                         job.run_id,
-                        lambda value: _finish_job(value, result.get("status") == "ok", job.attempt_id),
+                        lambda value: _finish_job(
+                            value,
+                            result.get("status") != "error",
+                            job.attempt_id,
+                            benchmark_failed=result.get("grade", {}).get("pass") is False,
+                        ),
                     )
-                    completed = final_state.get("status") in {"completed", "completed_with_errors", "cancelled"}
+                    completed = final_state.get("status") in {"completed", "execution_errors", "cancelled"}
                     self._refresh_report(job.run_id, force=completed)
                     set_attributes(
                         current,
@@ -666,6 +833,22 @@ class RunQueue:
                             set_attributes(memory_span, trim_memory())
                     if _can_model_review(result):
                         self._review_queue.put(ReviewJob(job.run_id, job.attempt_id))
+            except OpenRouterPolicyError as exc:
+                try:
+                    result = self._policy_outcome_result(job, exc)
+                    self.store.append_result(job.run_id, result)
+                    self.store.mutate_state(
+                        job.run_id,
+                        lambda value: _finish_job(
+                            value,
+                            True,
+                            job.attempt_id,
+                            benchmark_failed=True,
+                        ),
+                    )
+                    self._refresh_report(job.run_id)
+                except Exception:
+                    pass
             except Exception as exc:  # worker containment boundary
                 try:
                     result = self._error_result(job, exc)
@@ -724,16 +907,23 @@ class RunQueue:
 
     def _execute_review(self, job: ReviewJob) -> dict[str, Any] | None:
         reviews_path = self.store.run_dir(job.run_id) / "reviews.jsonl"
-        if any(
-            row.get("attempt_id") == job.attempt_id and row.get("reviewer_type") == "model"
+        existing_reviews = [
+            row
             for row in read_jsonl(reviews_path)
+            if row.get("attempt_id") == job.attempt_id
+        ]
+        if any(isinstance(row.get("score"), (int, float)) for row in existing_reviews):
+            return None
+        if not job.force and any(
+            row.get("attempt_id") == job.attempt_id and row.get("reviewer_type") == "model"
+            for row in existing_reviews
         ):
             return None
         result = self.store.result(job.run_id, job.attempt_id)
         if not result or not _can_model_review(result):
             return None
         attempts = self._review_attempt_counts(job.run_id).get(job.attempt_id, 0)
-        if attempts >= self.max_review_attempts:
+        if attempts >= self.max_review_attempts and not job.force:
             receipt = self._review_fuse_receipt(job.attempt_id, attempts)
             append_jsonl(reviews_path, receipt, self.store.lock(job.run_id))
             return receipt
@@ -759,6 +949,7 @@ class RunQueue:
                 "attempt_id": job.attempt_id,
                 "judge_model": self.judge_model,
                 "attempt_number": attempts + 1,
+                "manual_retry": job.force,
                 "started_at": utc_now(),
             },
             self.store.lock(job.run_id),
@@ -846,7 +1037,7 @@ class RunQueue:
     def _finish_skipped(self, job: Job) -> None:
         result = self._error_result(job, RuntimeError("Run cancelled"), status="cancelled")
         self.store.append_result(job.run_id, result)
-        self.store.mutate_state(job.run_id, lambda value: _finish_job(value, False, job.attempt_id))
+        self.store.mutate_state(job.run_id, lambda value: _finish_job(value, None, job.attempt_id))
 
     def _execute(self, job: Job) -> dict[str, Any]:
         manifest = self.store.manifest(job.run_id)
@@ -866,6 +1057,8 @@ class RunQueue:
                 outputs.append(completion.text)
                 turn_receipts.append(completion_receipt(completion, list(messages), sample_index))
                 merge_usage(total_usage, completion.usage)
+                if not completion.text.strip():
+                    break
                 provisional = grade_attempt(definition, [completion.text], parameters=rendered.parameters)
                 if provisional.get("pass"):
                     break
@@ -899,6 +1092,8 @@ class RunQueue:
                 outputs.append(completion.text)
                 turn_receipts.append(completion_receipt(completion, list(messages), sample_index))
                 merge_usage(total_usage, completion.usage)
+                if not completion.text.strip():
+                    break
                 messages.append({"role": "assistant", "content": completion.text})
                 if sample_index <= len(rendered.followups):
                     messages.append({"role": "user", "content": rendered.followups[sample_index - 1]})
@@ -991,6 +1186,30 @@ class RunQueue:
             "grade": {"score": 0.0, "pass": False, "verdict": "Request failed", "human_required": False},
         }
 
+    def _policy_outcome_result(self, job: Job, exc: OpenRouterPolicyError) -> dict[str, Any]:
+        return {
+            "attempt_id": job.attempt_id,
+            "run_id": job.run_id,
+            "status": "blocked",
+            "outcome_type": "provider_policy_block",
+            "model": job.model,
+            "eval_id": job.eval_id,
+            "condition": job.condition,
+            "repetition": job.repetition,
+            "completed_at": utc_now(),
+            "provider_error": str(exc),
+            "usage": {},
+            "cost_usd": 0,
+            "response": "",
+            "responses": [],
+            "grade": {
+                "score": 0.0,
+                "pass": False,
+                "verdict": "Provider safety filter blocked the benchmark prompt",
+                "human_required": False,
+            },
+        }
+
     def _refresh_report(self, run_id: str, *, force: bool = False) -> None:
         now = time.monotonic()
         with self._report_guard:
@@ -1041,16 +1260,32 @@ def _start_job(state: dict[str, Any], job: Job) -> None:
     state["active_attempts"] = active
 
 
-def _finish_job(state: dict[str, Any], success: bool, attempt_id: str) -> None:
+def _finish_job(
+    state: dict[str, Any],
+    execution_ok: bool | None,
+    attempt_id: str,
+    *,
+    benchmark_failed: bool = False,
+) -> None:
     state["active_jobs"] = max(0, int(state.get("active_jobs", 0)) - 1)
     state["completed_jobs"] = int(state.get("completed_jobs", 0)) + 1
-    key = "successful_jobs" if success else "failed_jobs"
-    state[key] = int(state.get(key, 0)) + 1
+    if execution_ok is True:
+        state["successful_jobs"] = int(state.get("successful_jobs", 0)) + 1
+    elif execution_ok is False:
+        state["failed_jobs"] = int(state.get("failed_jobs", 0)) + 1
+    else:
+        state["cancelled_jobs"] = int(state.get("cancelled_jobs", 0)) + 1
+    state["execution_error_jobs"] = int(state.get("failed_jobs", 0))
+    if benchmark_failed:
+        state["benchmark_failed_jobs"] = int(state.get("benchmark_failed_jobs", 0)) + 1
     active = dict(state.get("active_attempts", {}))
     active.pop(attempt_id, None)
     state["active_attempts"] = active
+    retry_attempts = set(state.get("retry_attempts") or [])
+    retry_attempts.discard(attempt_id)
+    state["retry_attempts"] = sorted(retry_attempts)
     if state["completed_jobs"] >= state["expected_jobs"]:
-        state["status"] = "completed" if not state.get("failed_jobs") else "completed_with_errors"
+        state["status"] = "completed" if not state.get("failed_jobs") else "execution_errors"
         if state.get("cancel_requested"):
             state["status"] = "cancelled"
         state["completed_at"] = utc_now()

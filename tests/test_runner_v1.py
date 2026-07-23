@@ -4,11 +4,23 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+from corey_bench.openrouter import Completion
 from corey_bench.protocol import load_protocol
-from corey_bench.runner import RunConfig, RunQueue, RunStore, suite_request_count
+from corey_bench.runner import RunConfig, RunQueue, RunStore, collapse_result_rows, suite_request_count
 
 
 class RunnerV1Tests(unittest.TestCase):
+    def test_append_only_result_corrections_use_latest_receipt(self):
+        rows = [
+            {"attempt_id": "a", "status": "error"},
+            {"attempt_id": "b", "status": "ok"},
+            {"attempt_id": "a", "status": "ok"},
+        ]
+        self.assertEqual(
+            collapse_result_rows(rows),
+            [{"attempt_id": "a", "status": "ok"}, {"attempt_id": "b", "status": "ok"}],
+        )
+
     def test_full_suite_request_upper_bound_includes_agentic_and_reviews(self):
         self.assertEqual(suite_request_count(load_protocol()), 573)
 
@@ -110,6 +122,161 @@ class RunnerV1Tests(unittest.TestCase):
             self.assertEqual(row["grade"], grade)
             self.assertTrue((store.run_dir(run_id) / ".svg-artifacts-v3.json").exists())
             self.assertEqual(queue._rebuild_svg_artifacts()["artifact.rebuilt_run_count"], 0)
+
+    def test_legacy_model_outcomes_are_results_but_transport_error_is_retryable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(directory)
+            run_id, jobs = store.create(
+                RunConfig(
+                    models=["example/model"],
+                    eval_ids=["1.2"],
+                    conditions=["weights-only"],
+                    repetitions=3,
+                ),
+                load_protocol(),
+            )
+            errors = [
+                'OpenRouter HTTP 400: {"error":{"type":"content_filter","message":"considered high risk"}}',
+                "OpenRouter HTTP 400: role 'assistant' must not be empty",
+                "OpenRouter request failed: IncompleteRead(3586 bytes read)",
+            ]
+            for job, error in zip(jobs, errors):
+                store.append_result(
+                    run_id,
+                    {
+                        "attempt_id": job.attempt_id,
+                        "status": "error",
+                        "model": job.model,
+                        "eval_id": job.eval_id,
+                        "condition": job.condition,
+                        "repetition": job.repetition,
+                        "error": error,
+                        "grade": {"score": 0, "pass": False, "human_required": False},
+                    },
+                )
+            store.update_state(
+                run_id,
+                status="completed_with_errors",
+                completed_jobs=3,
+                successful_jobs=0,
+                failed_jobs=3,
+            )
+            queue = RunQueue("test", store=store, judge_workers=0)
+
+            stats = queue._migrate_result_semantics()
+
+            self.assertEqual(stats["result.policy_outcome_count"], 1)
+            self.assertEqual(stats["result.empty_outcome_count"], 1)
+            self.assertEqual(
+                [row["status"] for row in store.results(run_id)],
+                ["blocked", "ok", "error"],
+            )
+            state = store.state(run_id)
+            self.assertEqual(state["status"], "execution_errors")
+            self.assertEqual(state["execution_error_jobs"], 1)
+            self.assertEqual(state["benchmark_failed_jobs"], 2)
+            self.assertEqual(state["successful_jobs"], 2)
+
+            self.assertEqual(queue.retry_execution_errors(run_id), 1)
+            state = store.state(run_id)
+            self.assertEqual(state["status"], "queued")
+            self.assertEqual(state["completed_jobs"], 2)
+            self.assertEqual(state["execution_error_jobs"], 0)
+            self.assertEqual(queue._queue.qsize(), 1)
+
+    def test_empty_multi_turn_response_is_graded_instead_of_replayed_as_assistant(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(directory)
+            run_id, jobs = store.create(
+                RunConfig(
+                    models=["example/model"],
+                    eval_ids=["5.8"],
+                    conditions=["weights-only"],
+                    repetitions=1,
+                ),
+                load_protocol(),
+            )
+            queue = RunQueue("test", store=store, judge_workers=0)
+            completion = Completion(
+                text="",
+                response_id="empty",
+                provider="fixture",
+                usage={"total_tokens": 1, "cost": 0.001},
+                raw_model="example/model",
+                reasoning=None,
+                finish_reason="stop",
+                native_finish_reason="stop",
+                annotations=[],
+            )
+            with patch.object(queue.client, "complete_messages", return_value=completion) as complete:
+                result = queue._execute(jobs[0])
+
+            self.assertEqual(complete.call_count, 1)
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["responses"], [""])
+            self.assertFalse(result["grade"]["pass"])
+
+    def test_manual_review_retry_bypasses_recovery_fuse_but_not_a_score(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(directory)
+            run_id, jobs = store.create(
+                RunConfig(
+                    models=["example/model"],
+                    eval_ids=["1.2"],
+                    conditions=["weights-only"],
+                    repetitions=1,
+                ),
+                load_protocol(),
+            )
+            store.append_result(
+                run_id,
+                {
+                    "attempt_id": jobs[0].attempt_id,
+                    "status": "ok",
+                    "model": jobs[0].model,
+                    "eval_id": jobs[0].eval_id,
+                    "condition": jobs[0].condition,
+                    "repetition": jobs[0].repetition,
+                    "grade": {
+                        "score": 1,
+                        "pass": True,
+                        "human_required": True,
+                        "verdict": "fixture",
+                    },
+                },
+            )
+            reviews = store.run_dir(run_id) / "reviews.jsonl"
+            reviews.write_text(
+                json.dumps(
+                    {
+                        "attempt_id": jobs[0].attempt_id,
+                        "reviewer_type": "model",
+                        "status": "skipped_recovery_fuse",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            queue = RunQueue("test", store=store, judge_workers=0)
+
+            self.assertEqual(queue.retry_pending_reviews(run_id), 1)
+            queued = queue._review_queue.get_nowait()
+            self.assertEqual(queued.attempt_id, jobs[0].attempt_id)
+            self.assertTrue(queued.force)
+
+            with reviews.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "attempt_id": jobs[0].attempt_id,
+                            "reviewer_type": "model",
+                            "score": 0.75,
+                        }
+                    )
+                    + "\n"
+                )
+            with self.assertRaisesRegex(ValueError, "No unresolved"):
+                queue.retry_pending_reviews(run_id)
 
 
 if __name__ == "__main__":

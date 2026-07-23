@@ -43,7 +43,7 @@
 </form>
 
 <section class="card"><div class="eyebrow">Durable queue</div><h2>Recent runs</h2>
-  {% if recent %}<table><thead><tr><th>Run</th><th>Status</th><th>Models</th><th>Progress</th></tr></thead><tbody>{% for run in recent %}<tr><td><a href="/runs/{{ run.run_id }}"><code>{{ run.run_id }}</code></a></td><td><span class="status {{ run.status }}">{{ run.status }}</span></td><td>{{ run.models|join(', ') }}</td><td>{{ run.completed_jobs }}/{{ run.expected_jobs }}</td></tr>{% endfor %}</tbody></table>{% else %}<p class="muted">No descents yet.</p>{% endif %}
+  {% if recent %}<table><thead><tr><th>Run</th><th>Execution status</th><th>Models</th><th>Processed</th></tr></thead><tbody>{% for run in recent %}<tr><td><a href="/runs/{{ run.run_id }}"><code>{{ run.run_id }}</code></a></td><td><span class="status {{ run.status }}">{{ run.status|replace('_',' ') }}</span></td><td>{{ run.models|join(', ') }}</td><td>{{ run.completed_jobs }}/{{ run.expected_jobs }}</td></tr>{% endfor %}</tbody></table>{% else %}<p class="muted">No descents yet.</p>{% endif %}
 </section>
 <script>
 const form=document.querySelector('#run-form'), list=document.querySelector('#models'), filter=document.querySelector('#model-filter'), sort=document.querySelector('#model-sort'), protocolCalls={{ requests_per_model }}, callsPerForcedRepetition={{ requests_per_forced_repetition }}, csrf={{ csrf_token|tojson }};

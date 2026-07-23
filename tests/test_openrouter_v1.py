@@ -1,10 +1,11 @@
 import io
+import http.client
 import json
 import unittest
 import urllib.error
 from unittest.mock import patch
 
-from corey_bench.openrouter import OpenRouterClient
+from corey_bench.openrouter import OpenRouterClient, OpenRouterPolicyError
 
 
 class FakeResponse:
@@ -66,6 +67,31 @@ class OpenRouterV1Tests(unittest.TestCase):
         )
         self.assertEqual(completion.request_attempts, 2)
         self.assertGreaterEqual(mocked_sleep.call_args.args[0], 3)
+
+    @patch("time.sleep")
+    @patch("urllib.request.urlopen")
+    def test_incomplete_response_is_retried(self, mocked_open, _mocked_sleep):
+        mocked_open.side_effect = [http.client.IncompleteRead(b"partial"), FakeResponse()]
+        completion = OpenRouterClient("key", attempts=2).complete_messages(
+            model="example/model", messages=[{"role": "user", "content": "hi"}],
+            max_tokens=20, temperature=1, seed=None, reasoning="off",
+        )
+        self.assertEqual(completion.request_attempts, 2)
+
+    @patch("urllib.request.urlopen")
+    def test_provider_content_filter_is_a_policy_outcome(self, mocked_open):
+        mocked_open.side_effect = urllib.error.HTTPError(
+            "https://openrouter.ai",
+            400,
+            "blocked",
+            {},
+            io.BytesIO(b'{"error":{"type":"content_filter","message":"considered high risk"}}'),
+        )
+        with self.assertRaises(OpenRouterPolicyError):
+            OpenRouterClient("key").complete_messages(
+                model="example/model", messages=[{"role": "user", "content": "hi"}],
+                max_tokens=20, temperature=1, seed=None, reasoning="off",
+            )
 
 
 if __name__ == "__main__":

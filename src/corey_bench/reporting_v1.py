@@ -7,7 +7,7 @@ from statistics import mean, median
 from typing import Any
 
 from .protocol import EvalSuite, load_protocol
-from .runner import read_jsonl
+from .runner import collapse_result_rows, read_jsonl
 
 
 def _review_scores(run_dir: Path) -> dict[str, float]:
@@ -31,6 +31,10 @@ def _review_costs(run_dir: Path) -> dict[str, float]:
 
 
 def _attempt_score(row: dict[str, Any], reviews: dict[str, float]) -> tuple[float | None, bool]:
+    # Execution errors and cancellations are missing benchmark evidence, not
+    # zero-scoring model outcomes.
+    if row.get("status") in {"error", "cancelled"}:
+        return None, False
     auto = row.get("grade", {}).get("score")
     human = reviews.get(str(row.get("attempt_id")))
     needs_human = bool(row.get("grade", {}).get("human_required"))
@@ -87,7 +91,9 @@ def _suite_completion(
     completed = {
         key
         for row in results
-        if row.get("model") == model and (key := _job_key(row)) is not None
+        if row.get("model") == model
+        and row.get("status") not in {"error", "cancelled"}
+        and (key := _job_key(row)) is not None
     }
     missing_scheduled = required - scheduled
     missing_completed = required - completed
@@ -122,7 +128,7 @@ def _suite_completion(
 def build_report_data(run_dir: Path, suite: EvalSuite | None = None) -> dict[str, Any]:
     suite = suite or load_protocol()
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    results = read_jsonl(run_dir / "results.jsonl")
+    results = collapse_result_rows(read_jsonl(run_dir / "results.jsonl"))
     reviews = _review_scores(run_dir)
     review_costs = _review_costs(run_dir)
     models = manifest.get("models", manifest.get("config", {}).get("models", []))
@@ -179,6 +185,12 @@ def build_report_data(run_dir: Path, suite: EvalSuite | None = None) -> dict[str
         total_cost = inference_cost + review_cost
         latencies = [float(row.get("latency_seconds", 0)) for row in attempts if row.get("status") == "ok"]
         total_tokens = sum(int(row.get("usage", {}).get("total_tokens") or 0) for row in attempts)
+        execution_error_attempts = sum(row.get("status") == "error" for row in attempts)
+        benchmark_failed_attempts = sum(
+            row.get("status") not in {"error", "cancelled"}
+            and row.get("grade", {}).get("pass") is False
+            for row in attempts
+        )
         resolved_score = weighted_points if abs(resolved_weight - 100) < 1e-9 else None
         final_score = resolved_score if completion["full_suite_complete"] else None
         model_rows.append(
@@ -192,7 +204,10 @@ def build_report_data(run_dir: Path, suite: EvalSuite | None = None) -> dict[str
                 "dollars_per_point": total_cost / final_score if final_score and final_score > 0 else None,
                 "median_latency": median(latencies) if latencies else None, "total_tokens": total_tokens,
                 "completed_attempts": len(attempts),
-                "failed_attempts": sum(row.get("status") != "ok" for row in attempts),
+                "failed_attempts": benchmark_failed_attempts,
+                "benchmark_failed_attempts": benchmark_failed_attempts,
+                "execution_error_attempts": execution_error_attempts,
+                "blocked_attempts": sum(row.get("status") == "blocked" for row in attempts),
             }
         )
     return {
@@ -200,6 +215,20 @@ def build_report_data(run_dir: Path, suite: EvalSuite | None = None) -> dict[str
         "suite": manifest.get("suite", {}), "models": model_rows,
         "expected_jobs": manifest.get("expected_jobs", len(manifest.get("jobs", []))),
         "completed_jobs": len(results),
+        "execution_health": {
+            "status": "errors" if any(row.get("status") == "error" for row in results) else "complete",
+            "processed_attempts": len(results),
+            "recorded_results": sum(
+                row.get("status") not in {"error", "cancelled"} for row in results
+            ),
+            "execution_errors": sum(row.get("status") == "error" for row in results),
+            "cancelled_attempts": sum(row.get("status") == "cancelled" for row in results),
+            "failed_tests": sum(
+                row.get("status") not in {"error", "cancelled"}
+                and row.get("grade", {}).get("pass") is False
+                for row in results
+            ),
+        },
     }
 
 
@@ -215,8 +244,8 @@ def report_markdown(data: dict[str, Any]) -> str:
     lines = [
         f"# Quinnferno — run {data['run_id']}", "",
         "## Headline metrics", "",
-        "| Model | Suite score | Total suite cost | Dollars per point | Coverage |",
-        "|---|---:|---:|---:|---:|",
+        "| Model | Suite score | Total suite cost | Dollars per point | Coverage | Failed tests | Execution errors |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for model in data["models"]:
         score = (
@@ -225,7 +254,11 @@ def report_markdown(data: dict[str, Any]) -> str:
             else f"Not ranked ({model['weighted_points']:.1f}/{model['resolved_weight']:.0f} provisional)"
         )
         coverage = f"{model['completed_required_attempts']}/{model['required_attempts']} required attempts"
-        lines.append(f"| `{model['model']}` | {score} | {_money(model['total_cost'])} | {_money(model['dollars_per_point'])} | {coverage} |")
+        lines.append(
+            f"| `{model['model']}` | {score} | {_money(model['total_cost'])} | "
+            f"{_money(model['dollars_per_point'])} | {coverage} | "
+            f"{model['benchmark_failed_attempts']} | {model['execution_error_attempts']} |"
+        )
     for model in data["models"]:
         lines.extend(["", f"## {model['model']}", "", "| Eval | Score | Cost/run | Verdict |", "|---|---:|---:|---|"])
         for row in model["evals"]:

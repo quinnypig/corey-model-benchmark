@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import random
 import time
@@ -29,6 +30,10 @@ class Completion:
 
 class OpenRouterError(RuntimeError):
     pass
+
+
+class OpenRouterPolicyError(OpenRouterError):
+    """A provider-side safety policy outcome, not a transport failure."""
 
 
 PRIVACY_SETTINGS_URL = "https://openrouter.ai/settings/privacy"
@@ -238,8 +243,14 @@ class OpenRouterClient:
                         last_retry_after = 0.0
                     set_attributes(current, {"http.response.status_code": exc.code})
                     if not retryable or attempt == self.attempts:
+                        if exc.code == 400 and (
+                            "content_filter" in error_body or "considered high risk" in error_body
+                        ):
+                            raise OpenRouterPolicyError(
+                                f"Provider safety filter blocked the benchmark prompt: {error_body}"
+                            ) from exc
                         raise OpenRouterError(f"OpenRouter HTTP {exc.code}: {error_body}") from exc
-                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, http.client.HTTPException) as exc:
                     retry_error = type(exc).__name__
                     if attempt == self.attempts:
                         raise OpenRouterError(f"OpenRouter request failed: {exc}") from exc

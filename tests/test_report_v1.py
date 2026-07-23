@@ -78,6 +78,58 @@ class ReportV1Tests(unittest.TestCase):
             self.assertTrue(model["rankable"])
             self.assertAlmostEqual(model["final_score"], 75.0)
 
+            # A harness/provider execution error is missing evidence: it must
+            # invalidate suite completion and cannot become a zero score.
+            failed_job = jobs[0]
+            store.append_result(
+                run_id,
+                {
+                    "attempt_id": failed_job.attempt_id,
+                    "status": "error",
+                    "model": failed_job.model,
+                    "eval_id": failed_job.eval_id,
+                    "condition": failed_job.condition,
+                    "repetition": failed_job.repetition,
+                    "error": "transient transport failure",
+                    "grade": {"score": 0, "pass": False, "human_required": False},
+                },
+            )
+            model = build_report_data(store.run_dir(run_id), suite)["models"][0]
+            self.assertEqual(model["completed_required_attempts"], 96)
+            self.assertEqual(model["execution_error_attempts"], 1)
+            self.assertEqual(model["benchmark_failed_attempts"], 0)
+            self.assertFalse(model["full_suite_complete"])
+            self.assertFalse(model["rankable"])
+
+            # A repaired attempt that fails its rubric is valid benchmark
+            # evidence and restores suite completion.
+            store.append_result(
+                run_id,
+                {
+                    "attempt_id": failed_job.attempt_id,
+                    "status": "ok",
+                    "model": failed_job.model,
+                    "eval_id": failed_job.eval_id,
+                    "condition": failed_job.condition,
+                    "repetition": failed_job.repetition,
+                    "cost_usd": 0.01,
+                    "latency_seconds": 1,
+                    "usage": {"total_tokens": 10},
+                    "grade": {
+                        "score": 0,
+                        "pass": False,
+                        "human_required": False,
+                        "verdict": "model failed the rubric",
+                    },
+                },
+            )
+            model = build_report_data(store.run_dir(run_id), suite)["models"][0]
+            self.assertEqual(model["completed_required_attempts"], 97)
+            self.assertEqual(model["execution_error_attempts"], 0)
+            self.assertEqual(model["benchmark_failed_attempts"], 1)
+            self.assertTrue(model["full_suite_complete"])
+            self.assertTrue(model["rankable"])
+
 
 if __name__ == "__main__":
     unittest.main()

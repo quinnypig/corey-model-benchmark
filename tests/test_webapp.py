@@ -27,6 +27,14 @@ class FakeQueue:
         self.submitted = config
         return "full-suite-test"
 
+    def retry_execution_errors(self, run_id):
+        self.retried_run_id = run_id
+        return 1
+
+    def retry_pending_reviews(self, run_id):
+        self.retried_reviews_run_id = run_id
+        return 1
+
 
 class WebAppTests(unittest.TestCase):
     def test_roster_pricing_labels_are_per_million(self):
@@ -128,6 +136,59 @@ class WebAppTests(unittest.TestCase):
                 self.assertEqual(archive.mimetype, "application/zip")
             finally:
                 os.chdir(previous)
+
+    def test_run_page_separates_execution_errors_from_failed_tests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            queue = FakeQueue(Path(directory))
+            run_id, jobs = queue.store.create(
+                RunConfig(
+                    models=["example/model"],
+                    eval_ids=["3.2"],
+                    conditions=["weights-only"],
+                    repetitions=1,
+                ),
+                queue.suite,
+            )
+            queue.store.append_result(
+                run_id,
+                {
+                    "attempt_id": jobs[0].attempt_id,
+                    "status": "error",
+                    "model": jobs[0].model,
+                    "eval_id": jobs[0].eval_id,
+                    "condition": jobs[0].condition,
+                    "repetition": jobs[0].repetition,
+                    "error": "upstream connection reset",
+                    "grade": {"score": 0, "pass": False, "human_required": False},
+                },
+            )
+            queue.store.update_state(
+                run_id,
+                status="execution_errors",
+                completed_jobs=1,
+                failed_jobs=1,
+                execution_error_jobs=1,
+            )
+            app = create_app(run_queue=queue)
+            app.config["TESTING"] = True
+            client = app.test_client()
+
+            page = client.get(f"/runs/{run_id}")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn(b"1 execution error needs repair", page.data)
+            self.assertIn(b"infrastructure/provider errors, not failed tests", page.data)
+            self.assertIn(b"upstream connection reset", page.data)
+            self.assertIn(b"no benchmark result until repaired", page.data)
+
+            client.get("/")
+            with client.session_transaction() as browser_session:
+                csrf = browser_session["csrf"]
+            response = client.post(
+                f"/runs/{run_id}/retry-errors",
+                data={"csrf": csrf},
+            )
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(queue.retried_run_id, run_id)
 
 
 if __name__ == "__main__":
