@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 
-from corey_bench.model_cards import build_model_cards
+from corey_bench.model_cards import build_model_cards, build_model_comparison
 from corey_bench.protocol import load_protocol
 from corey_bench.runner import RunConfig, RunStore
 
@@ -44,6 +44,13 @@ class ModelCardTests(unittest.TestCase):
             self.assertIsNone(partial["representative_run"]["score_percent"])
             self.assertEqual(partial["representative_run"]["provisional_score_percent"], 100.0)
             self.assertEqual(partial["representative_run"]["completed_required_attempts"], 3)
+
+            comparison = build_model_comparison(cards[:1], suite)
+            self.assertEqual(len(comparison["sections"]), 7)
+            aws = next(section for section in comparison["sections"] if section["tier"] == 3)
+            self.assertEqual(aws["title"], "AWS reasoning")
+            iam = next(test for test in aws["tests"] if test["eval_id"] == "3.2")
+            self.assertEqual(iam["cells"][0]["weights_score"], 0.5)
 
     @staticmethod
     def _result(job, score):

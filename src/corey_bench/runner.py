@@ -474,6 +474,7 @@ class RunQueue:
             state["execution_error_jobs"] = len(execution_errors)
             state["cancelled_jobs"] = len(cancelled)
             state["benchmark_failed_jobs"] = len(benchmark_failures)
+            state["benchmark_miss_jobs"] = len(benchmark_failures)
             if len(results) >= int(state.get("expected_jobs") or 0):
                 if state.get("status") == "budget_exhausted":
                     return
@@ -1278,6 +1279,7 @@ def _finish_job(
     state["execution_error_jobs"] = int(state.get("failed_jobs", 0))
     if benchmark_failed:
         state["benchmark_failed_jobs"] = int(state.get("benchmark_failed_jobs", 0)) + 1
+        state["benchmark_miss_jobs"] = int(state.get("benchmark_miss_jobs", 0)) + 1
     active = dict(state.get("active_attempts", {}))
     active.pop(attempt_id, None)
     state["active_attempts"] = active

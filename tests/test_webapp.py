@@ -124,9 +124,16 @@ class WebAppTests(unittest.TestCase):
                 self.assertIn(b"Tested model roster", models_page)
                 self.assertIn(b"not ranked", models_page)
                 model_page = client.get("/models/example/model").data
-                self.assertIn(b"Capability profile", model_page)
+                self.assertIn(b"Section profile", model_page)
+                self.assertIn(b"Every test in isolation", model_page)
                 self.assertIn(b"not yet a valid model card", model_page)
                 self.assertIn(b"1 of 97 required attempts", model_page)
+                comparison = client.get("/models/compare?models=example/model")
+                self.assertEqual(comparison.status_code, 200)
+                self.assertIn(b"Capability comparison", comparison.data)
+                self.assertIn(b"AWS reasoning", comparison.data)
+                self.assertIn(b"The IAM Policy Evaluation Quiz", comparison.data)
+                self.assertIn(b"Inspect responses", comparison.data)
                 self.assertIn(b"ALLOWED", client.get("/responses?model=example/model&eval=3.2").data)
                 exported = client.get("/models/example/model/responses.jsonl")
                 self.assertEqual(exported.status_code, 200)
@@ -137,7 +144,7 @@ class WebAppTests(unittest.TestCase):
             finally:
                 os.chdir(previous)
 
-    def test_run_page_separates_execution_errors_from_failed_tests(self):
+    def test_run_page_separates_execution_errors_from_benchmark_outcomes(self):
         with tempfile.TemporaryDirectory() as directory:
             queue = FakeQueue(Path(directory))
             run_id, jobs = queue.store.create(
@@ -176,9 +183,10 @@ class WebAppTests(unittest.TestCase):
             page = client.get(f"/runs/{run_id}")
             self.assertEqual(page.status_code, 200)
             self.assertIn(b"1 execution error needs repair", page.data)
-            self.assertIn(b"infrastructure/provider errors, not failed tests", page.data)
+            self.assertIn(b"no valid benchmark outcome", page.data)
+            self.assertIn(b"exceptional infrastructure, transport, or parsing failures", page.data)
             self.assertIn(b"upstream connection reset", page.data)
-            self.assertIn(b"no benchmark result until repaired", page.data)
+            self.assertIn(b"run is incomplete until they are repaired", page.data)
 
             client.get("/")
             with client.session_transaction() as browser_session:

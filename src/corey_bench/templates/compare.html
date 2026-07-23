@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Compare models · Quinnferno{% endblock %}
+{% block hero %}<section class="hero"><div class="shell hero-inner"><div><div class="eyebrow">Capability comparison</div><h1>{{ comparison.cards|length }} model{% if comparison.cards|length != 1 %}s{% endif %}, every receipt.</h1><p>Section rollups show the baseline weighted score within each tier. The matrices below expose every eval, alternate condition, verdict, and response trail.</p></div><div class="hero-stat"><b>{{ comparison.cards|length }}</b><span>models selected</span></div></div></section>{% endblock %}
+{% block content %}
+<section class="card compare-picker">
+  <div class="card-heading"><div><div class="eyebrow">Comparison set</div><h2>Choose up to six models</h2></div><p class="muted">One model gives an isolated profile; two or more reveal relative strengths.</p></div>
+  <form method="get" action="{{ url_for('model_compare') }}" id="comparison-picker">
+    <div class="compare-options">{% for card in cards %}<label class="compare-option"><input type="checkbox" name="models" value="{{ card.id }}" {% if card.id in selected_ids %}checked{% endif %}><span><strong>{{ card.name }}</strong><small>{{ card.id }}</small></span></label>{% endfor %}</div>
+    <div class="compare-actions"><span><b id="compare-count">{{ selected_ids|length }}</b> selected</span><button type="submit">Update comparison</button><a class="button ghost" href="{{ url_for('model_index') }}">Back to roster</a></div>
+  </form>
+</section>
+
+{% if comparison.cards %}
+<section class="comparison-overview">
+{% for card in comparison.cards %}{% set report=card.representative_run %}<article class="compare-model">
+  <div class="eyebrow">{{ 'Complete suite' if report.full_suite_complete else 'Partial evidence' }}</div>
+  <h2><a href="{{ url_for('model_detail',model_id=card.id) }}">{{ card.name }}</a></h2><span class="model-id">{{ card.id }}</span>
+  <div class="compare-score">{% if report.rankable %}{{ '%.1f'|format(report.score_percent) }}<small>/100</small>{% else %}—{% endif %}</div>
+  <div class="mini-bar"><i style="width:{{ report.score_percent or 0 }}%"></i></div>
+  <dl><div><dt>Benchmark misses</dt><dd>{{ report.benchmark_miss_attempts }}</dd></div><div><dt>Execution</dt><dd class="{{ 'health-bad' if report.execution_error_attempts else 'health-good' }}">{{ report.execution_error_attempts ~ ' errors' if report.execution_error_attempts else 'healthy' }}</dd></div><div><dt>Suite cost</dt><dd>${{ '%.4f'|format(report.total_cost) }}</dd></div></dl>
+</article>{% endfor %}
+</section>
+
+<nav class="section-nav" aria-label="Comparison sections">{% for section in comparison.sections %}<a href="#tier-{{ section.tier }}">Tier {{ section.tier }} · {{ section.title }}</a>{% endfor %}</nav>
+
+{% for section in comparison.sections %}
+<section class="card comparison-section" id="tier-{{ section.tier }}">
+  <div class="card-heading"><div><div class="eyebrow">Tier {{ section.tier }}</div><h2>{{ section.title }}</h2></div><a href="#top">Back to top ↑</a></div>
+  <div class="section-score-grid">{% for model in section.models %}<article class="section-score"><a href="{{ url_for('model_detail',model_id=model.id) }}">{{ model.name }}</a><b>{% if model.score is not none %}{{ '%.1f'|format(model.score*100) }}%{% else %}—{% endif %}</b><small>{{ model.scored_tests }}/{{ model.total_tests }} scoring evals{% if not model.complete %} · partial{% endif %}</small><div class="mini-bar"><i style="width:{{ (model.score*100) if model.score is not none else 0 }}%"></i></div></article>{% endfor %}</div>
+  <div class="compare-wrap"><table class="compare matrix"><thead><tr><th>Eval</th>{% for card in comparison.cards %}<th><a class="model-name" href="{{ url_for('model_detail',model_id=card.id) }}">{{ card.name }}</a></th>{% endfor %}</tr></thead><tbody>
+  {% for test in section.tests %}<tr><td class="eval-label"><span class="pill">{{ test.eval_id }}</span><strong>{{ test.title }}</strong><small>{{ '%.0f'|format(test.weight) }} suite points{% if test.weight == 0 %} · unweighted{% endif %}</small><a href="{{ url_for('responses',eval=test.eval_id) }}">All answers →</a></td>
+  {% for cell in test.cells %}<td class="score-cell {{ 'winner' if cell.is_best and comparison.cards|length > 1 else '' }}">{% if cell.weights_score is not none %}<strong>{{ '%.1f'|format(cell.weights_score*100) }}%</strong>{% if cell.is_best and comparison.cards|length > 1 %}<span class="pill good">best</span>{% endif %}{% else %}<strong>—</strong>{% endif %}
+    <div class="condition-scores">{% for condition in test.conditions if condition != 'weights-only' %}{% set value=cell.scores.get(condition) %}<span><b>{{ 'Search' if condition == 'search-enabled' else 'Agentic' }}</b> {% if value is not none %}{{ '%.1f'|format(value*100) }}%{% else %}pending{% endif %}</span>{% endfor %}</div>
+    <p class="cell-verdict">{{ cell.verdict }}</p><div class="cell-meta">${{ '%.4f'|format(cell.cost_usd) }} · {{ cell.attempts }} attempts</div><a href="{{ url_for('responses',model=cell.model_id,eval=test.eval_id) }}">Inspect responses →</a>
+  </td>{% endfor %}</tr>{% endfor %}
+  </tbody></table></div>
+</section>
+{% endfor %}
+{% else %}<section class="card empty-state"><h2>Choose at least one tested model.</h2></section>{% endif %}
+<script>
+const picker=document.querySelector('#comparison-picker'),boxes=[...picker.querySelectorAll('input[name=models]')],count=document.querySelector('#compare-count');
+function updateComparisonPicker(){const checked=boxes.filter(box=>box.checked);count.textContent=checked.length;boxes.forEach(box=>box.disabled=!box.checked&&checked.length>=6);picker.querySelector('button[type=submit]').disabled=checked.length===0}
+picker.addEventListener('change',updateComparisonPicker);updateComparisonPicker();
+</script>
+{% endblock %}

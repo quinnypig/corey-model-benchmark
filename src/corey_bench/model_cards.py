@@ -78,7 +78,10 @@ def build_model_cards(
                 "completed_attempts": int(model_report.get("completed_attempts") or 0),
                 "failed_attempts": int(model_report.get("failed_attempts") or 0),
                 "benchmark_failed_attempts": int(model_report.get("benchmark_failed_attempts") or 0),
+                "benchmark_miss_attempts": int(model_report.get("benchmark_miss_attempts") or 0),
                 "execution_error_attempts": int(model_report.get("execution_error_attempts") or 0),
+                "blocked_attempts": int(model_report.get("blocked_attempts") or 0),
+                "empty_response_attempts": int(model_report.get("empty_response_attempts") or 0),
                 "evals": model_report.get("evals", []),
                 "terminal": state.get("status") in TERMINAL_STATUSES,
             }
@@ -104,6 +107,9 @@ def build_model_cards(
         card["total_cost"] = sum(row["total_cost"] for row in card["runs"])
         card["total_attempts"] = sum(row["completed_attempts"] for row in card["runs"])
         card["failed_attempts"] = sum(row["failed_attempts"] for row in card["runs"])
+        card["benchmark_miss_attempts"] = sum(
+            row["benchmark_miss_attempts"] for row in card["runs"]
+        )
         card["execution_error_attempts"] = sum(row["execution_error_attempts"] for row in card["runs"])
         card["total_tokens"] = sum(row["total_tokens"] for row in card["runs"])
         card["valid"] = card["representative_run"]["full_suite_complete"]
@@ -119,6 +125,115 @@ def build_model_cards(
             card["name"].casefold(),
         ),
     )
+
+
+TIER_LABELS = {
+    1: "Shitposting & instruction following",
+    2: "Coding",
+    3: "AWS reasoning",
+    4: "Voice",
+    5: "Alignment",
+    6: "Long-game consistency",
+    7: "Frontier markers",
+}
+
+
+def build_model_comparison(
+    cards: list[dict[str, Any]],
+    suite: EvalSuite,
+) -> dict[str, Any]:
+    """Build comparable tier and eval matrices from representative runs."""
+    profiles = {
+        card["id"]: {row["eval_id"]: row for row in card.get("eval_profile", [])}
+        for card in cards
+    }
+    sections = []
+    for tier in range(1, 8):
+        definitions = [definition for definition in suite.evals if definition.tier == tier]
+        if not definitions:
+            continue
+        scored_definitions = [
+            definition for definition in definitions
+            if definition.weight > 0 and definition.status != "alternate"
+        ] or definitions
+        section_models = []
+        for card in cards:
+            model_profile = profiles[card["id"]]
+            score_rows = []
+            for definition in scored_definitions:
+                profile = model_profile.get(definition.id)
+                score = profile.get("scores", {}).get("weights-only") if profile else None
+                if isinstance(score, (int, float)):
+                    score_rows.append((float(score), definition.weight))
+            complete = len(score_rows) == len(scored_definitions)
+            positive_weight = sum(weight for _score, weight in score_rows if weight > 0)
+            if positive_weight:
+                score = sum(value * weight for value, weight in score_rows) / positive_weight
+            elif score_rows:
+                score = sum(value for value, _weight in score_rows) / len(score_rows)
+            else:
+                score = None
+            section_models.append(
+                {
+                    "id": card["id"],
+                    "name": card["name"],
+                    "score": score,
+                    "scored_tests": len(score_rows),
+                    "total_tests": len(scored_definitions),
+                    "complete": complete,
+                }
+            )
+
+        tests = []
+        for definition in definitions:
+            cells = []
+            weights_scores = []
+            for card in cards:
+                profile = profiles[card["id"]].get(definition.id)
+                scores = dict(profile.get("scores", {})) if profile else {}
+                weights_score = scores.get("weights-only")
+                if isinstance(weights_score, (int, float)):
+                    weights_scores.append(float(weights_score))
+                cells.append(
+                    {
+                        "model_id": card["id"],
+                        "model_name": card["name"],
+                        "scores": scores,
+                        "weights_score": weights_score,
+                        "attempts": int(profile.get("attempts") or 0) if profile else 0,
+                        "cost_usd": float(profile.get("cost_usd") or 0) if profile else 0,
+                        "verdict": profile.get("verdict", "Not run") if profile else "Not run",
+                    }
+                )
+            best = max(weights_scores) if weights_scores else None
+            for cell in cells:
+                cell["is_best"] = (
+                    best is not None
+                    and isinstance(cell["weights_score"], (int, float))
+                    and abs(float(cell["weights_score"]) - best) < 1e-12
+                )
+            tests.append(
+                {
+                    "eval_id": definition.id,
+                    "title": definition.title,
+                    "weight": definition.weight,
+                    "conditions": [
+                        condition
+                        for condition in ("weights-only", "search-enabled", "agentic")
+                        if any(condition in cell["scores"] for cell in cells)
+                    ],
+                    "cells": cells,
+                }
+            )
+        sections.append(
+            {
+                "tier": tier,
+                "title": TIER_LABELS.get(tier, definitions[0].category.replace("_", " ").title()),
+                "models": section_models,
+                "tests": tests,
+            }
+        )
+    return {"cards": cards, "sections": sections}
 
 
 def _eval_profile(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

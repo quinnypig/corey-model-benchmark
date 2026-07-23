@@ -15,7 +15,7 @@ from flask import Flask, Response, abort, flash, jsonify, redirect, render_templ
 
 from .cli import _load_dotenv
 from .costing import estimate_run_cost
-from .model_cards import build_model_cards
+from .model_cards import build_model_cards, build_model_comparison
 from .openrouter import OpenRouterError
 from .reporting_v1 import build_report_data, write_v1_reports
 from .responses import response_records
@@ -112,6 +112,26 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
             total_cost=sum(card["total_cost"] for card in cards),
         )
 
+    @app.get("/models/compare")
+    def model_compare() -> str:
+        cards = build_model_cards(store, suite, catalog.get())
+        requested = list(dict.fromkeys(request.args.getlist("models")))
+        if len(requested) > 6:
+            abort(400, "Compare at most six models at once")
+        by_id = {card["id"]: card for card in cards}
+        unknown = [model_id for model_id in requested if model_id not in by_id]
+        if unknown:
+            abort(404)
+        if not requested:
+            requested = [card["id"] for card in cards if card["rankable"]][:3]
+        selected = [by_id[model_id] for model_id in requested]
+        return render_template(
+            "compare.html",
+            comparison=build_model_comparison(selected, suite),
+            cards=cards,
+            selected_ids=set(requested),
+        )
+
     @app.get("/models/<path:model_id>")
     def model_detail(model_id: str) -> str:
         cards = build_model_cards(store, suite, catalog.get())
@@ -126,7 +146,12 @@ def create_app(*, runs_root: str | Path | None = None, run_queue: RunQueue | Non
                         platypus_cards.append({"run_id": run["run_id"], **row})
             except (OSError, ValueError):
                 continue
-        return render_template("model.html", card=card, platypus_cards=platypus_cards[:6])
+        return render_template(
+            "model.html",
+            card=card,
+            comparison=build_model_comparison([card], suite),
+            platypus_cards=platypus_cards[:6],
+        )
 
     @app.get("/models/<path:model_id>/responses.jsonl")
     def model_responses_jsonl(model_id: str) -> Response:

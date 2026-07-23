@@ -186,7 +186,7 @@ def build_report_data(run_dir: Path, suite: EvalSuite | None = None) -> dict[str
         latencies = [float(row.get("latency_seconds", 0)) for row in attempts if row.get("status") == "ok"]
         total_tokens = sum(int(row.get("usage", {}).get("total_tokens") or 0) for row in attempts)
         execution_error_attempts = sum(row.get("status") == "error" for row in attempts)
-        benchmark_failed_attempts = sum(
+        benchmark_miss_attempts = sum(
             row.get("status") not in {"error", "cancelled"}
             and row.get("grade", {}).get("pass") is False
             for row in attempts
@@ -204,10 +204,16 @@ def build_report_data(run_dir: Path, suite: EvalSuite | None = None) -> dict[str
                 "dollars_per_point": total_cost / final_score if final_score and final_score > 0 else None,
                 "median_latency": median(latencies) if latencies else None, "total_tokens": total_tokens,
                 "completed_attempts": len(attempts),
-                "failed_attempts": benchmark_failed_attempts,
-                "benchmark_failed_attempts": benchmark_failed_attempts,
+                # Keep the older fields in report JSON for consumers written
+                # before outcome terminology was clarified.
+                "failed_attempts": benchmark_miss_attempts,
+                "benchmark_failed_attempts": benchmark_miss_attempts,
+                "benchmark_miss_attempts": benchmark_miss_attempts,
                 "execution_error_attempts": execution_error_attempts,
                 "blocked_attempts": sum(row.get("status") == "blocked" for row in attempts),
+                "empty_response_attempts": sum(
+                    row.get("outcome_type") == "empty_response" for row in attempts
+                ),
             }
         )
     return {
@@ -223,7 +229,7 @@ def build_report_data(run_dir: Path, suite: EvalSuite | None = None) -> dict[str
             ),
             "execution_errors": sum(row.get("status") == "error" for row in results),
             "cancelled_attempts": sum(row.get("status") == "cancelled" for row in results),
-            "failed_tests": sum(
+            "benchmark_misses": sum(
                 row.get("status") not in {"error", "cancelled"}
                 and row.get("grade", {}).get("pass") is False
                 for row in results
@@ -244,7 +250,7 @@ def report_markdown(data: dict[str, Any]) -> str:
     lines = [
         f"# Quinnferno — run {data['run_id']}", "",
         "## Headline metrics", "",
-        "| Model | Suite score | Total suite cost | Dollars per point | Coverage | Failed tests | Execution errors |",
+        "| Model | Suite score | Total suite cost | Dollars per point | Coverage | Benchmark misses | Execution errors |",
         "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for model in data["models"]:
@@ -257,7 +263,7 @@ def report_markdown(data: dict[str, Any]) -> str:
         lines.append(
             f"| `{model['model']}` | {score} | {_money(model['total_cost'])} | "
             f"{_money(model['dollars_per_point'])} | {coverage} | "
-            f"{model['benchmark_failed_attempts']} | {model['execution_error_attempts']} |"
+            f"{model['benchmark_miss_attempts']} | {model['execution_error_attempts']} |"
         )
     for model in data["models"]:
         lines.extend(["", f"## {model['model']}", "", "| Eval | Score | Cost/run | Verdict |", "|---|---:|---:|---|"])
@@ -266,7 +272,15 @@ def report_markdown(data: dict[str, Any]) -> str:
             score = f"{row['score'] * 100:.1f}%" if row["score"] is not None else "Pending review"
             per_run = row["cost_usd"] / row["attempts"] if row["attempts"] else None
             lines.append(f"| {row['eval_id']} {label} | {score} | {_money(per_run)} | {row['verdict']} |")
-    lines.extend(["", "Models are not ranked until every required current-protocol test attempt is recorded and every weighted human or deferred judgment is resolved. Tier 7 is reported separately and never contributes to /100.", ""])
+    lines.extend(
+        [
+            "",
+            "A benchmark miss is a valid terminal outcome that did not meet the pass criteria; an execution error means no valid outcome was recorded and requires repair.",
+            "",
+            "Models are not ranked until every required current-protocol eval attempt is recorded and every weighted human or deferred judgment is resolved. Tier 7 is reported separately and never contributes to /100.",
+            "",
+        ]
+    )
     return "\n".join(lines)
 
 
