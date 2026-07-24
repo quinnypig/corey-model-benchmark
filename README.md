@@ -127,6 +127,11 @@ Absent inputs are shown as pending review rather than guessed. The included vari
 
 The multi-architecture image is built by GitHub Actions and published as `ghcr.io/quinnypig/quinnferno`. It runs as UID/GID 1001, listens on port 8765, and stores durable run data under `/data/runs`.
 
+The build context intentionally excludes `.git`, so BuildKit may warn that it
+could not capture current commit information. The workflow supplies image
+revision labels separately; do not add repository history to the image context
+just to suppress that harmless warning.
+
 ```bash
 docker build -t quinnferno .
 docker run --rm -p 8765:8765 \
@@ -155,6 +160,63 @@ successful response, and retains it after a failure:
   docker rm -f "$container"
 )
 ```
+
+For bind-mounted historical data, give the image's UID access to the exact
+temporary directory before starting the container. Files created by the
+container may not remain traversable by the host user, so inspect them with
+`sudo` and restore ownership before cleanup:
+
+```bash
+fixture_dir="$(mktemp -d)"
+sudo chown 1001:1001 "$fixture_dir"
+sudo chmod 0755 "$fixture_dir"
+docker run --name quinnferno-history-smoke -d \
+  -p 127.0.0.1:8765:8765 \
+  -e OPENROUTER_API_KEY \
+  -v "$fixture_dir:/data" \
+  quinnferno
+sudo find "$fixture_dir" -maxdepth 3 -type f -print
+sudo chown -R "$(id -u):$(id -g)" "$fixture_dir"
+```
+
+## Kubernetes diagnostics
+
+Do not guess the live pod name or application port. Resolve both from the
+workload, use the bundled Python runtime instead of assuming `wget` or `jq` is
+in the slim image, and pass `-i` whenever an inline script is sent on standard
+input:
+
+```bash
+namespace=quinnferno
+pod="$(
+  kubectl get pods -n "$namespace" -l app.kubernetes.io/name=quinnferno \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}'
+)"
+port="$(
+  kubectl get deployment -n "$namespace" quinnferno \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="quinnferno")].ports[?(@.name=="http")].containerPort}'
+)"
+
+kubectl exec -n "$namespace" "$pod" -- \
+  python -c \
+  'import sys, urllib.request; print(urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/healthz").read().decode())' \
+  "$port"
+
+kubectl exec -i -n "$namespace" "$pod" -- \
+  python - /data/runs/<run-id>/state.json <<'PY'
+import json
+import sys
+
+print(json.dumps(json.load(open(sys.argv[1])), indent=2))
+PY
+
+kubectl cp "$namespace/$pod:/data/runs" ./quinnferno-runs
+```
+
+Run host-side `jq`, `find`, or visual tooling against the copied directory.
+Unlike `kubectl exec`, `kubectl cp` requires the concrete pod name resolved
+above; it does not accept `deployment/quinnferno`.
 
 ## Legacy CLI
 
