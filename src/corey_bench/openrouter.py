@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
+import os
 import random
 import time
 import urllib.error
@@ -164,6 +166,8 @@ class OpenRouterClient:
             "gen_ai.chat",
             {
                 "gen_ai.operation.name": "chat",
+                "app.cost.scope": "model_call",
+                "app.cost.pricing_status": "no_usage_reported",
                 "gen_ai.provider.name": "openrouter",
                 "gen_ai.request.model": payload.get("model"),
                 "gen_ai.request.max_tokens": payload.get("max_tokens"),
@@ -176,6 +180,7 @@ class OpenRouterClient:
             },
             kind=SpanKind.CLIENT,
         ) as current:
+            _capture_content(current, "request", payload)
             body = json.dumps(payload).encode("utf-8")
             request = urllib.request.Request(
                 f"{self.base_url}/chat/completions",
@@ -196,6 +201,18 @@ class OpenRouterClient:
                     with urllib.request.urlopen(request, timeout=self.timeout) as response:
                         raw = json.loads(response.read())
                         set_attributes(current, {"http.response.status_code": getattr(response, "status", 200)})
+                    _capture_content(current, "response", raw)
+                    reported_cost = (raw.get("usage") or {}).get("cost")
+                    if isinstance(reported_cost, (int, float)) and not isinstance(reported_cost, bool) and math.isfinite(reported_cost) and reported_cost >= 0:
+                        set_attributes(current, {
+                            "gen_ai.usage.cost_usd": reported_cost,
+                            "app.cost.pricing_status": "priced",
+                            "app.cost.pricing_source": "provider_response",
+                            "app.cost.estimated": False,
+                            "app.cost.currency": "USD",
+                        })
+                    else:
+                        set_attributes(current, {"app.cost.pricing_status": "no_cost_reported" if raw.get("usage") else "no_usage_reported"})
                     choices = raw.get("choices")
                     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
                         raise OpenRouterError("OpenRouter returned HTTP 200 without a usable completion choice")
@@ -290,3 +307,14 @@ class OpenRouterClient:
             seed=seed,
             reasoning=reasoning,
         )
+
+
+def _capture_content(current, direction: str, value: Any) -> None:
+    if os.environ.get("OTEL_GENAI_CAPTURE_CONTENT") == "false":
+        return
+    content = json.dumps(value, ensure_ascii=False)
+    set_attributes(current, {
+        f"app.ai.{direction}.content": content[:16384],
+        f"app.ai.{direction}.content_length": len(content),
+        f"app.ai.{direction}.content_truncated": len(content) > 16384,
+    })
