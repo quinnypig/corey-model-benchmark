@@ -1,5 +1,5 @@
 # Quinnferno web application and durable model-evaluation worker.
-FROM python:3.14-slim
+FROM python:3.15-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
